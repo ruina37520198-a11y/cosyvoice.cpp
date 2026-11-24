@@ -284,6 +284,12 @@ COSYVOICE_API uint32_t   cosyvoice_llm_get_n_accepted_tokens(cosyvoice_context_t
  */
 COSYVOICE_API const int* cosyvoice_llm_get_accepted_tokens(cosyvoice_context_t ctx);
 
+/** Generated/accepted history includes silence consumed by the LLM.
+ * These emitted tokens alone are suitable for the vocoder. Borrowed until mutation.
+ */
+COSYVOICE_API uint32_t cosyvoice_llm_get_n_emitted_tokens(cosyvoice_context_t ctx);
+COSYVOICE_API const int* cosyvoice_llm_get_emitted_tokens(cosyvoice_context_t ctx);
+
 // ----------------------------------------------------------------------------
 // Low-Level Inference Routines
 // ----------------------------------------------------------------------------

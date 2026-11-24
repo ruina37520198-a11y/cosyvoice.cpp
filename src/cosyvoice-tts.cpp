@@ -1,4 +1,6 @@
-﻿#include "cosyvoice-internal.h"
+#include "cosyvoice-diagnostics.h"
+#include "cosyvoice-internal.h"
+#include "cosyvoice-model.h"
 #include "cosyvoice-text-chunk.h"
 
 #include <algorithm>
@@ -45,6 +47,8 @@ static uint32_t decode_utf8_cp(std::string_view text, std::size_t i, std::size_t
 
 static inline bool strip_emoji(std::string_view text, std::string& result)
 {
+    result.clear();
+
     result.reserve(text.size());
     bool removed = false;
     bool prev_emoji = false;
@@ -103,6 +107,7 @@ struct cosyvoice_tts_context : cosyvoice_tokenization_result_impl, cosyvoice_pro
 
     bool tts_job(const char* text, const char* instruction, float speed, cosyvoice_inference_mode mode, cosyvoice_generated_speech_ptr result, cosyvoice_tts_audio_callback_t callback, void* user_data)
     {
+        aitable_tts_diag::scope diagnostic(dynamic_cast<cosyvoice_model*>(ctx)->worker->diagnostic,"high_level_enter", "high_level_return");
         instruction_cache.resize(prefix_len);
         if (instruction)
         {

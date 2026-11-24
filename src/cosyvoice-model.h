@@ -1,9 +1,11 @@
 #pragma once
 
 #include "cosyvoice-modules.h"
+#include "cosyvoice-diagnostics.h"
 #include "cosyvoice-lowlevel.h"
 #include "cosyvoice-interface.h"
 #include "cosyvoice-kv-cache.h"
+#include "cosyvoice-output-tokens.h"
 
 #include <ggml-cpp.h>
 
@@ -30,6 +32,7 @@ struct cosyvoice_model_shared
 
     std::mt19937 noise_rng;
     std::shared_mutex noise_mutex;
+    std::shared_mutex adapter_mutex;
     std::unique_ptr<float[]> rand_noise;
     uint32_t rand_noise_len;
     cosyvoice_generation_config_t config;
@@ -39,6 +42,8 @@ struct cosyvoice_model_shared
 
     std::unique_ptr<char[]> architecture;
     std::unique_ptr<char[]> instruction_prefix;
+    std::vector<int> instruction_prefix_tokens;
+    int endofprompt_token_id = -1;
 };
 
 struct cosyvoice_worker_context
@@ -55,17 +60,21 @@ struct cosyvoice_worker_context
 
     ggml_tensor* llm_input;
     ggml_tensor* llm_probs;
+    ggml_tensor* llm_top_k = nullptr;
+    ggml_tensor* llm_full_probs = nullptr;
     ggml_tensor* position_ids;
     ggml_tensor* causal_mask;
+    ggml_tensor* causal_mask_task = nullptr;
+    ggml_tensor* decode_mask = nullptr;
+    uint32_t inst_mask_begin = 0;
+    uint32_t inst_mask_end = 0;
+    bool decode_mask_active = false;
 
     std::mt19937 sampler_rng, noise_rng;
 
-    std::vector<int> tokens;
+    std::vector<int> tokens; // generated history, including filtered silence
+    cosyvoice_output_tokens output_tokens;
 
-    // Consecutive-silent-token counter for the FSQ silence filtering. It must
-    // survive across llm_job_ext() calls that continue the same generation
-    // (streaming chunks), so it lives in the worker instead of the job call.
-    uint32_t silent_token_num{0};
 
     cosyvoice_kv_cache llm_kv_cache;
     cosyvoice_kv_cache dit_kv_cache;
@@ -73,6 +82,10 @@ struct cosyvoice_worker_context
     ggml_status status;
     uint32_t prompt_crc32;
     uint32_t sampler_seed;
+    cosyvoice_progress_callback_t progress_callback = nullptr;
+    void* progress_user_data = nullptr;
+    cosyvoice_progress_t progress = {};
+    cosyvoice_failure_stats_t failure_stats = {};
     cosyvoice_generation_config_t config;
     cosyvoice_sampler_t sampler;
     void* sampler_ctx;
@@ -84,6 +97,7 @@ struct cosyvoice_worker_context
     // reference implementation, and crops away the already-emitted prefix at
     // this sample offset before handing the result to the caller.
     uint32_t wav_offset{0};
+    uint32_t emitted_mel_frames{0};
     std::vector<uint32_t> chunk_boundaries;
     uint32_t offset{0};
     std::unique_ptr<char[]> batch_buffer;
@@ -92,13 +106,19 @@ struct cosyvoice_worker_context
     // preparing the nucleus is idempotent and can be repeated for one logits
     // state without re-filtering already normalized probabilities.
     std::unique_ptr<float[]> nucleus_raw;
+    ggml_backend_buffer_ptr pinned_nucleus_buffer;
+    size_t pinned_nucleus_capacity = 0;
+
     uint32_t nucleus_probs_capacity;
     int nucleus_probs_len;
     bool raw_probs_masked;
+    bool raw_probs_fetched = false;
+    bool raw_probs_need_stop_mask = false;
     std::unique_ptr<float[]> probs;
     ggml_backend_buffer_ptr llm_kv_buffer;
     ggml_backend_buffer_ptr dit_kv_buffer;
 
+    aitable_tts_diag::state diagnostic;
     std::atomic<bool> stop_flag{false};
     std::atomic<int>  use_count{0};
     std::mutex        cv_mutex;
@@ -112,6 +132,7 @@ struct cosyvoice_model : virtual cosyvoice_model_context, virtual cosyvoice_obje
 
     virtual void load(gguf_loader& loader) = 0;
 
+    void set_progress_callback(cosyvoice_progress_callback_t callback, void* user_data);
     uint32_t get_worker_no();
     uint32_t get_n_workers();
     void request_stop();
@@ -122,7 +143,7 @@ struct cosyvoice_model : virtual cosyvoice_model_context, virtual cosyvoice_obje
     void llm_offload_kv_cache();
     void llm_load_kv_cache();
 
-    int llm_sample_token();
+    virtual int llm_sample_token();
     void llm_accept_token(int token);
     void llm_clear_accepted_tokens();
     uint32_t llm_get_n_accepted_tokens();
@@ -167,6 +188,10 @@ struct cosyvoice_model : virtual cosyvoice_model_context, virtual cosyvoice_obje
 
 struct cosyvoice_model_3_shared
 {
+    ggml_context_ptr lora_ctx;
+    ggml_backend_buffer_ptr lora_buffer;
+    bool lora_enabled = false;
+    uint64_t lora_generation = 0;
     CausalMaskedDiffWithDiT flow;
     CausalHiFTGenerator hift;
     CosyVoice3LM llm;
@@ -195,6 +220,8 @@ struct cosyvoice_model_3 : cosyvoice_model
 
     bool llm_decode(ggml_type type, const void* data);
     void llm_prepare_probs(bool allow_stop_tokens);
+    void ensure_full_probs_ready();
+    int llm_sample_token() override;
     bool llm_prefill(ggml_type type, const void* data, uint32_t seq_len);
     bool llm_prefill_logits(ggml_type type, const void* data, uint32_t seq_len);
 
@@ -209,6 +236,7 @@ struct cosyvoice_model_3 : cosyvoice_model
     uint32_t get_hift_rand_ini_len();
     void set_hift_rand_ini(const float* data);
 
+    void llm_accept_token(int token);
     bool llm_job(const int* text, uint32_t text_len, cosyvoice_prompt_t prompt);
     bool llm_job_ext(const int* text, uint32_t text_len, cosyvoice_prompt_t prompt, uint32_t max_new_tokens, bool* final);
     bool token2wav(const int* token_ids, uint32_t n_tokens, float speed, cosyvoice_prompt_t prompt, cosyvoice_generated_speech_ptr result);
@@ -221,4 +249,11 @@ struct cosyvoice_model_3 : cosyvoice_model
     cosyvoice_model_3_shared* cv3_shared;
     cosyvoice_3_worker_context* cv3_workers;
     cosyvoice_3_worker_context* cv3_worker;
+};
+
+void cosyvoice_report_progress(cosyvoice_worker_context*, uint32_t stage, uint32_t phase = 0) noexcept;
+struct cosyvoice_progress_scope {
+    cosyvoice_worker_context* worker; uint32_t phase;
+    cosyvoice_progress_scope(cosyvoice_worker_context* w, uint32_t p) noexcept : worker(w),phase(p) { cosyvoice_report_progress(worker,3,phase); }
+    ~cosyvoice_progress_scope() { cosyvoice_report_progress(worker,4,phase); }
 };

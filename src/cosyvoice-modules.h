@@ -1,3 +1,4 @@
+namespace hift_research { struct Capture; }
 #pragma once
 
 #include "cosyvoice-internal.h"
@@ -35,6 +36,10 @@ struct Conv1d : BasicModule
 
 struct Linear : BasicModule
 {
+    // Optional low-rank branch. Disabled means the original graph, not scale zero.
+    ggml_tensor* lora_a = nullptr;
+    ggml_tensor* lora_b = nullptr;
+    const bool* lora_enabled = nullptr;
     ggml_tensor* build_cgraph(ggml_context* ctx, ggml_tensor* x) const;
 };
 
@@ -96,6 +101,7 @@ struct AdaLayerNormZero
     void OnLoad(gguf_loader& loader, const std::string& prefix);
 
     std::array<ggml_tensor*, 5> build_cgraph(ggml_context* ctx, ggml_tensor* x, ggml_tensor* emb) const;
+    ggml_tensor* build_cgraph_precomputed(ggml_context* ctx, ggml_tensor* x, ggml_tensor* shift_msa, ggml_tensor* scale_msa_p1) const;
 };
 
 struct Attention
@@ -134,6 +140,10 @@ struct DiTBlock
     void OnLoad(gguf_loader& loader, const std::string& prefix);
 
     ggml_tensor* build_cgraph(ggml_context* ctx, ggml_tensor* x, ggml_tensor* time_emb, ggml_tensor* position_ids, int64_t cut_len, cosyvoice_kv_cache* kv_cache, ggml_cgraph* gf, ggml_tensor* attn_mask, int layer_idx) const;
+    ggml_tensor* build_cgraph_precomputed(ggml_context* ctx, ggml_tensor* x,
+        ggml_tensor* shift_msa, ggml_tensor* scale_msa_p1, ggml_tensor* gate_msa,
+        ggml_tensor* shift_mlp, ggml_tensor* scale_mlp_p1, ggml_tensor* gate_mlp,
+        ggml_tensor* position_ids, int64_t cut_len, cosyvoice_kv_cache* kv_cache, ggml_cgraph* gf, ggml_tensor* attn_mask, int layer_idx) const;
 };
 
 struct AdaLayerNorm_Final
@@ -145,6 +155,13 @@ struct AdaLayerNorm_Final
     void OnLoad(gguf_loader& loader, const std::string& prefix);
 
     ggml_tensor* build_cgraph(ggml_context* ctx, ggml_tensor* x, ggml_tensor* emb) const;
+    ggml_tensor* build_cgraph_precomputed(ggml_context* ctx, ggml_tensor* x, ggml_tensor* scale_p1, ggml_tensor* shift) const;
+};
+
+struct DiTModulationHandle
+{
+    ggml_tensor* step_base = nullptr;
+    std::vector<ggml_tensor*> views;
 };
 
 struct DiT
@@ -157,12 +174,15 @@ struct DiT
     AdaLayerNorm_Final norm_out;
     Linear proj_out;
 
+    // Precomputed per-diffusion-step AdaLN modulation table [D, 6*depth + 2, diffusion_steps] F32.
+    ggml_tensor* adaln_table = nullptr;
+
     int mel_dim;
     constexpr static int static_chunk_size = 50;
 
     void OnLoad(gguf_loader& loader, const std::string& prefix);
 
-    ggml_tensor* build_cgraph(ggml_context* ctx, ggml_tensor* x, ggml_tensor* mu, ggml_tensor* t, ggml_tensor* spks, ggml_tensor* cond, int64_t cut_len, ggml_tensor*& position_ids, ggml_backend_op_capabilities capabilities, cosyvoice_kv_cache* kv_cache, ggml_tensor** ref_attn_mask, ggml_cgraph* gf) const;
+    ggml_tensor* build_cgraph(ggml_context* ctx, ggml_tensor* x, ggml_tensor* mu, ggml_tensor* t, ggml_tensor* spks, ggml_tensor* cond, int64_t cut_len, ggml_tensor*& position_ids, ggml_backend_op_capabilities capabilities, cosyvoice_kv_cache* kv_cache, ggml_tensor** ref_attn_mask, ggml_cgraph* gf, int step_idx = -1, DiTModulationHandle* adaln_handle = nullptr) const;
 };
 
 struct CausalConditionalCFM
@@ -187,7 +207,7 @@ struct CausalConditionalCFM
 
     DiTContext prepare_context(ggml_context* ctx, ggml_tensor* mu, ggml_tensor* spks, ggml_tensor* cond) const;
     std::array<float, 2> get_t_and_dt(ggml_context* ctx, int step) const;
-    ggml_tensor* build_cgraph_one_step(ggml_context* ctx, const DiTContext& ditctx, int step, ggml_backend_op_capabilities capabilities, int64_t cut_len, ggml_tensor*& t_tensor, ggml_tensor*& position_ids, ggml_cgraph* gf, cosyvoice_kv_cache* kv_cache, ggml_tensor** attn_mask) const;
+    ggml_tensor* build_cgraph_one_step(ggml_context* ctx, const DiTContext& ditctx, int step, ggml_backend_op_capabilities capabilities, int64_t cut_len, ggml_tensor*& t_tensor, ggml_tensor*& position_ids, ggml_cgraph* gf, cosyvoice_kv_cache* kv_cache, ggml_tensor** attn_mask, DiTModulationHandle* adaln_handle = nullptr) const;
 };
 
 struct PreLookaheadLayer
@@ -304,6 +324,7 @@ struct Snake
 
     static constexpr float no_div_by_zero = 0.000000001f;
     ggml_tensor* alpha;
+    ggml_tensor* inv_alpha = nullptr;
 
     ggml_tensor* build_cgraph(ggml_context* ctx, ggml_tensor* x) const;
 };
@@ -346,6 +367,8 @@ struct CausalHiFTGenerator
     // phase offset and exports a checkpoint row so the next streaming chunk
     // resumes at the correct oscillator phase.
     std::array<ggml_tensor*, 2> build_cgraph(ggml_context* ctx, ggml_tensor* speech_feat, bool finalize, SineGen2::phase_state* state = nullptr) const;
+    std::array<ggml_tensor*, 2> build_cgraph_capture(ggml_context* ctx, ggml_tensor* speech_feat, bool finalize, hift_research::Capture* capture, SineGen2::phase_state* state = nullptr) const;
+
 
     int overlap_length() const;
     void set_rand_ini(const float* data) const;
@@ -374,6 +397,7 @@ struct Qwen2MLP
     Linear gate_proj;
     Linear up_proj;
     Linear down_proj;
+    ggml_tensor* gate_up_weight = nullptr;
 };
 
 struct Qwen2RMSNorm
@@ -393,6 +417,8 @@ struct Qwen2Attention
     Linear k_proj;
     Linear v_proj;
     Linear o_proj;
+    ggml_tensor* qkv_weight = nullptr;
+    ggml_tensor* qkv_bias = nullptr;
 };
 
 struct Qwen2DecoderLayer

@@ -1,9 +1,12 @@
+#include "cosyvoice-hift-capture.h"
+#include "cosyvoice-diagnostics.h"
 #include "cosyvoice-internal.h"
 #include "cosyvoice-model.h"
 #include "ggml-cpu-flag.h"
 #include "common.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -86,7 +89,7 @@ static void set_graph_backends(ggml_cgraph* gf, ggml_backend_sched_t sched, ggml
             case GGML_OP_CPY:
                 if (node->type == GGML_TYPE_I32 && node->src[0]->type == GGML_TYPE_F32)
                 {
-                    target_backend = cpu_backend;
+                    target_backend = ggml_backend_supports_op(backend, node) ? backend : cpu_backend;
                     break;
                 }
             default:
@@ -128,8 +131,13 @@ struct dit_sched_config
     dit_sched_config(const cosyvoice_context_params_v4_cpp& params, int64_t cut_len, uint32_t offset, bool streaming, bool kv_slidable, int diffusion_steps)
         : n(diffusion_steps)
     {
-        if (!streaming)
+        if (!streaming || (params.dit_kv_fixed_slots == 0 && params.dit_kv_offloadable_slots == 0))
         {
+            // Non-streaming or streaming without DiT KV cache: every call already runs
+            // all diffusion steps over [prompt + all tokens]. Keeping bidirectional
+            // DiT attention consistent across chunks and returning all generated mel
+            // frames [prompt_len .. end) avoids block-causal boundary shifts and lets
+            // unemitted lookahead frames crossfade cleanly into full-context mel.
             for (int i = 0; i != n; ++i)
             {
                 graph_config[i].rebuild = false;
@@ -229,7 +237,12 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
         worker->chunk_boundaries.clear();
         worker->flow_cache.clear();
         worker->wav_offset = 0;
+        worker->emitted_mel_frames = 0;
     }
+
+    const bool seam_fix = streaming
+        && params.dit_kv_fixed_slots == 0
+        && params.dit_kv_offloadable_slots == 0;
 
     ggml_reset(ctx0.get());
     ggml_reset(ctx1.get());
@@ -310,72 +323,96 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
     else
         full_len = seq_len;
 
+    aitable_tts_diag::mark(worker->diagnostic, "flow_begin", -1, get_worker_no());
     float* noise_buffer = shared->noise_callback(COSYVOICE_NOISE_CALLBACK_STAGE_BEFORE_FLOW, noise_req, nullptr, shared->noise_callback_ctx);
-    ggml_backend_tensor_set_async(backend.get(), ditctx.x, noise_buffer + noise_req - noise_len, 0, ditctx.x->nb[2]);
+    ggml_backend_tensor_set(ditctx.x, noise_buffer + noise_req - noise_len, 0, ditctx.x->nb[2]);
 
     // Phase 2: Flow decode steps
     ggml_tensor* t_leaf;
     ggml_tensor* position_ids;
     ggml_tensor* attn_mask;
+    DiTModulationHandle adaln_handle;
     if (config[0].cache_kv)
         kv_cache->bind_slot(config[0].phys_slot);
-    auto feat = flow.decoder.build_cgraph_one_step(ctx0.get(), ditctx, 1, op_caps, config[0].cut_len, t_leaf, position_ids, gf, config[0].cache_kv ? kv_cache : nullptr, config[0].mask ? &attn_mask : nullptr);
+    auto feat = flow.decoder.build_cgraph_one_step(ctx0.get(), ditctx, 1, op_caps, config[0].cut_len, t_leaf, position_ids, gf, config[0].cache_kv ? kv_cache : nullptr, config[0].mask ? &attn_mask : nullptr, &adaln_handle);
     ggml_build_forward_expand(gf, feat);
     set_graph_backends(gf, sched.get(), backend.get(), cpu_backend.get(), op_caps);
+    ggml_backend_sched_set_tensor_backend(sched.get(), position_ids, backend.get());
+    if (config[0].mask && attn_mask)
+        ggml_backend_sched_set_tensor_backend(sched.get(), attn_mask, backend.get());
     ggml_backend_sched_synchronize(sched.get());
     ggml_backend_sched_alloc_graph(sched.get(), gf);
 
+    std::vector<int32_t> pos_host;
+    std::vector<ggml_fp16_t> mask_host;
     auto stage_build_after = [&](int step)
     {
-        if (!op_caps.fill) ggml_set_zero(t_leaf);
+        if (t_leaf && !op_caps.fill) ggml_set_zero(t_leaf);
 
         const auto base = config[step].cache_kv ? kv_cache->cur_len : 0;
+        pos_host.resize(static_cast<size_t>(position_ids->ne[0] * position_ids->ne[1]));
         for (int64_t i = 0; i < position_ids->ne[1]; ++i)
         {
-            auto cur_row = reinterpret_cast<int32_t*>(position_ids->data) + i * position_ids->ne[0];
+            auto cur_row = pos_host.data() + i * position_ids->ne[0];
             for (int32_t j = 0; j < position_ids->ne[0]; ++j)
                 cur_row[j] = j + base;
         }
+        ggml_backend_tensor_set(position_ids, pos_host.data(), 0, pos_host.size() * sizeof(int32_t));
 
         if (config[step].mask)
         {
             const int64_t block = DiT::static_chunk_size;
+            const int64_t real_seq = position_ids->ne[0];
+            const int64_t mask_kv = attn_mask->ne[0];
+            const int64_t mask_q = attn_mask->ne[1];
+            mask_host.resize(static_cast<size_t>(mask_kv * mask_q));
             if (absolute_dit_coords)
             {
                 // Match the reference streaming mask: fixed static chunks counted
                 // from mel position 0 (prompt included), each query attending all
                 // left context plus the whole chunk it belongs to. Rows with a
                 // base offset (cut_len > 0) encode the query's absolute position
-                // = base + row.
+                // = base + row. Padded KV columns [real_seq, mask_kv) and padded
+                // query rows [real_seq, mask_q) are filled with -inf.
                 const int64_t base = config[step].cut_len;
-                for (int64_t i = 0; i < attn_mask->ne[0]; ++i)
+                for (int64_t i = 0; i < mask_q; ++i)
                 {
-                    const int64_t pos = base + i;
-                    auto block_end = (pos / block + 1) * block;
-                    if (block_end > attn_mask->ne[1]) block_end = attn_mask->ne[1];
-                    auto row = reinterpret_cast<ggml_fp16_t*>(attn_mask->data) + i * attn_mask->ne[1];
-                    for (int64_t j = 0; j < attn_mask->ne[1]; ++j)
+                    auto row = mask_host.data() + i * mask_kv;
+                    int64_t block_end = 0;
+                    if (i < real_seq)
+                    {
+                        const int64_t pos = base + i;
+                        block_end = (pos / block + 1) * block;
+                        if (block_end > real_seq) block_end = real_seq;
+                    }
+                    for (int64_t j = 0; j < mask_kv; ++j)
                         row[j] = j < block_end ? 0 : 0xFC00;
                 }
             }
             else
             {
                 const auto& bounds = worker->chunk_boundaries;
-                for (int64_t i = 0; i < attn_mask->ne[0]; ++i)
+                for (int64_t i = 0; i < mask_q; ++i)
                 {
-                    auto it = std::upper_bound(bounds.begin(), bounds.end(), static_cast<uint32_t>(i));
-                    int64_t block_end = it != bounds.end()
-                        ? static_cast<int64_t>(*it)
-                        : attn_mask->ne[1];
-                    auto row = reinterpret_cast<ggml_fp16_t*>(attn_mask->data) + i * attn_mask->ne[1];
-                    for (int64_t j = 0; j < attn_mask->ne[1]; ++j)
+                    auto row = mask_host.data() + i * mask_kv;
+                    int64_t block_end = 0;
+                    if (i < real_seq)
+                    {
+                        auto it = std::upper_bound(bounds.begin(), bounds.end(), static_cast<uint32_t>(i));
+                        block_end = it != bounds.end()
+                            ? static_cast<int64_t>(*it)
+                            : real_seq;
+                        if (block_end > real_seq) block_end = real_seq;
+                    }
+                    for (int64_t j = 0; j < mask_kv; ++j)
                         row[j] = j < block_end ? 0 : 0xFC00;
                 }
             }
+            ggml_backend_tensor_set(attn_mask, mask_host.data(), 0, mask_host.size() * sizeof(ggml_fp16_t));
         }
 
         if (config[step].cache_kv)
-            kv_cache->set_input_v_idxs(backend.get(), reinterpret_cast<const int32_t*>(position_ids->data), static_cast<uint32_t>(position_ids->ne[0] * position_ids->ne[1]), static_cast<uint32_t>(position_ids->ne[0]));
+            kv_cache->set_input_v_idxs(backend.get(), pos_host.data(), static_cast<uint32_t>(position_ids->ne[0] * position_ids->ne[1]), static_cast<uint32_t>(position_ids->ne[0]));
     };
 
     stage_build_after(0);
@@ -400,6 +437,7 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
     load_kv(0);
 
     worker->status = ggml_backend_sched_graph_compute(sched.get(), gf);
+    aitable_tts_diag::mark(worker->diagnostic, "flow_first_step_end", -1, get_worker_no());
     shared->noise_callback(COSYVOICE_NOISE_CALLBACK_STAGE_AFTER_FLOW, noise_req, noise_buffer, shared->noise_callback_ctx);
     if (params.inference_buffer_policy != COSYVOICE_INFERENCE_BUFFER_POLICY_DEDICATED)
         llm_set_kv_cache_len(0);
@@ -470,9 +508,12 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
                 ggml_backend_sched_reset(sched.get());
 
             gf = new_cgraph(ctx0.get());
-            feat = flow.decoder.build_cgraph_one_step(ctx0.get(), ditctx, step + 1, op_caps, config[step].cut_len, t_leaf, position_ids, gf, config[step].cache_kv ? kv_cache : nullptr, config[step].mask ? &attn_mask : nullptr);
+            feat = flow.decoder.build_cgraph_one_step(ctx0.get(), ditctx, step + 1, op_caps, config[step].cut_len, t_leaf, position_ids, gf, config[step].cache_kv ? kv_cache : nullptr, config[step].mask ? &attn_mask : nullptr, &adaln_handle);
             ggml_build_forward_expand(gf, feat);
             set_graph_backends(gf, sched.get(), backend.get(), cpu_backend.get(), op_caps);
+            ggml_backend_sched_set_tensor_backend(sched.get(), position_ids, backend.get());
+            if (config[step].mask && attn_mask)
+                ggml_backend_sched_set_tensor_backend(sched.get(), attn_mask, backend.get());
             ggml_backend_sched_alloc_graph(sched.get(), gf);
             stage_build_after(step);
         }
@@ -482,7 +523,16 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
             GGML_ASSERT(scale_node->op == GGML_OP_SCALE);
             // Match the rebuild branch, which advances this iteration to step + 1.
             auto [t, dt] = flow.decoder.get_t_and_dt(ctx0.get(), step + 1);
-            reinterpret_cast<float*>(t_leaf->op_params)[op_caps.fill ? 0 : 1] = t;
+            if (adaln_handle.step_base)
+            {
+                auto* new_base = static_cast<char*>(flow.decoder.estimator.adaln_table->data)
+                    + static_cast<size_t>(step) * flow.decoder.estimator.adaln_table->nb[2];
+                adaln_handle.step_base->data = new_base;
+                for (auto* v : adaln_handle.views)
+                    v->data = new_base + v->view_offs;
+            }
+            else
+                reinterpret_cast<float*>(t_leaf->op_params)[op_caps.fill ? 0 : 1] = t;
             reinterpret_cast<float*>(scale_node->op_params)[0] = dt;
 
             load_kv(step);
@@ -498,7 +548,8 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
     // Phase 3: Copy flow output to speech_feat (persistent buffer)
     ggml_reset(ctx1.get());
     const auto cache_length = streaming ? static_cast<int64_t>(worker->flow_cache.size() / feat->ne[0]) : 0;
-    ggml_tensor* speech_feat = ggml_new_tensor_2d(ctx1.get(), feat->type, feat->ne[0], feat->ne[1] + cache_length);
+    const bool seam_blend = seam_fix && cache_length > 0 && feat->ne[1] >= cache_length;
+    ggml_tensor* speech_feat = ggml_new_tensor_2d(ctx1.get(), feat->type, feat->ne[0], seam_blend ? feat->ne[1] : (feat->ne[1] + cache_length));
     // Place the mel after the DiT context tensors. Both live in the same buffer
     // and the DiT tensors are much smaller than the mel when the DiT KV cache is
     // in use; sharing the base would let the mel overwrite the flow state and the
@@ -520,19 +571,45 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
         ggml_backend_tensor_alloc(token2wav_buffer.get(), speech_feat,
             ggml_backend_buffer_get_base(token2wav_buffer.get()));
     }
-    if (cache_length != 0)
+    int64_t mel_new_frames = feat->ne[1];
+    if (seam_blend)
+    {
+        const int64_t mel_dim = feat->ne[0];
+        const int64_t total_frames = feat->ne[1];
+        std::vector<float> full_mel(static_cast<size_t>(total_frames * mel_dim));
+        ggml_backend_tensor_get(feat, full_mel.data(), 0, full_mel.size() * sizeof(float));
+        const int64_t lock_end = std::min<int64_t>(worker->emitted_mel_frames, cache_length);
+        // Lock frames already emitted as PCM to preserve HiFT left context and phase.
+        if (lock_end > 0)
+            std::memcpy(full_mel.data(), worker->flow_cache.data(), static_cast<size_t>(lock_end * mel_dim) * sizeof(float));
+        // Cosine-crossfade the unemitted lookahead frames [lock_end .. cache_length)
+        // from prior flow_cache into the fresh full-context mel to eliminate boundary cliffs.
+        const int64_t blend_len = cache_length - lock_end;
+        for (int64_t k = 0; k < blend_len; ++k)
+        {
+            const float alpha = 0.5f - 0.5f * std::cos(3.14159265358979323846f * static_cast<float>(k + 1) / static_cast<float>(blend_len + 1));
+            const float beta = 1.0f - alpha;
+            float* dst_row = full_mel.data() + static_cast<size_t>((lock_end + k) * mel_dim);
+            const float* old_row = worker->flow_cache.data() + static_cast<size_t>((lock_end + k) * mel_dim);
+            for (int64_t d = 0; d < mel_dim; ++d)
+                dst_row[d] = beta * old_row[d] + alpha * dst_row[d];
+        }
+        ggml_backend_tensor_set(speech_feat, full_mel.data(), 0, full_mel.size() * sizeof(float));
+        mel_new_frames = total_frames - cache_length;
+        if (streaming && !finalize)
+            worker->flow_cache = std::move(full_mel);
+    }
+    else if (cache_length != 0)
     {
         auto speech_feat_view = ggml_view_2d(ctx0.get(), speech_feat, speech_feat->ne[0], feat->ne[1], speech_feat->nb[1], speech_feat->nb[1] * cache_length);
         speech_feat_view->buffer = speech_feat->buffer;
-        ggml_backend_tensor_set_async(backend.get(), speech_feat, worker->flow_cache.data(), 0, speech_feat->nb[2] - feat->nb[2]);
+        ggml_backend_tensor_set(speech_feat, worker->flow_cache.data(), 0, speech_feat->nb[2] - feat->nb[2]);
         ggml_backend_tensor_copy_async(backend.get(), backend.get(), feat, speech_feat_view);
     }
     else
         ggml_backend_tensor_copy_async(backend.get(), backend.get(), feat, speech_feat);
 
-    const int64_t mel_new_frames = feat->ne[1];
-
-    if (streaming && !finalize)
+    if (!seam_blend && streaming && !finalize)
     {
         // Keep the whole new mel: every chunk re-runs the vocoder over the
         // accumulated mel and hands out only the tail past the already-emitted
@@ -569,7 +646,14 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
     // over the full accumulated mel, so the frame-rate rad cumsum starts from
     // zero and continues the previous chunks' phase by construction — the
     // reference implementation relies on the same property.
-    auto [generated_speech, noise] = hift.build_cgraph(ctx0.get(), speech_feat, finalize, nullptr);
+    auto capture_request = hift_research::request(worker, cache_length == 0,
+        worker->diagnostic.level.load(std::memory_order_acquire) >= 3);
+    hift_research::Capture capture(capture_request, worker->sampler_seed, get_worker_no());
+    capture.keep("mel", speech_feat);
+    capture.keep("initial_phase", hift.m_source.l_sin_gen.rand_ini);
+    auto [generated_speech, noise] = hift.build_cgraph_capture(ctx0.get(), speech_feat, finalize, &capture, nullptr);
+    capture.keep("noise", noise);
+    capture.keep("full_pcm", generated_speech);
     ggml_build_forward_expand(gf, generated_speech);
     set_graph_backends(gf, sched.get(), backend.get(), cpu_backend.get(), op_caps);
 
@@ -587,6 +671,8 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
                     hift.f0_predictor.condnet_0.output_length(speech_feat->ne[0],
                         finalize), true), true), true), true) * hift.scale_factor * noise->ne[0]);
     noise_req = std::max(noise_req, noise_len);
+    aitable_tts_diag::mark(worker->diagnostic, "flow_end", -1, get_worker_no());
+    aitable_tts_diag::mark(worker->diagnostic, "hift_begin", -1, get_worker_no());
     noise_buffer = shared->noise_callback(COSYVOICE_NOISE_CALLBACK_STAGE_BEFORE_HIFT, noise_req, nullptr, shared->noise_callback_ctx);
     ggml_backend_tensor_set_async(backend.get(), noise, noise_buffer + noise_req - noise_len, 0, noise->nb[2]);
 
@@ -596,8 +682,17 @@ bool cosyvoice_model_3::token2wav_ext(const int* token_ids, uint32_t n_tokens, f
     result->length = worker->wav_offset < generated_speech->ne[0]
         ? static_cast<uint32_t>(generated_speech->ne[0] - worker->wav_offset) : 0;
     worker->status = ggml_backend_sched_graph_compute(sched.get(), gf);
+    aitable_tts_diag::mark(worker->diagnostic, "hift_end", -1, get_worker_no());
+    if (worker->status == GGML_STATUS_SUCCESS)
+        capture.write();
     shared->noise_callback(COSYVOICE_NOISE_CALLBACK_STAGE_AFTER_HIFT, noise_req, noise_buffer, shared->noise_callback_ctx);
+    const auto prior_offset = worker->wav_offset;
     worker->wav_offset += result->length;
+    worker->emitted_mel_frames = static_cast<uint32_t>(std::lround(
+        (static_cast<double>(worker->wav_offset) / static_cast<double>(hift.scale_factor)) * static_cast<double>(speed)));
+    capture.boundary(prior_offset, worker->wav_offset, result->length, finalize, cache_length, mel_new_frames);
+    if (capture_request)
+        hift_research::finish(worker, finalize || !streaming);
 
     static const bool log_phase = std::getenv("COSYVOICE_HIFT_PHASE_LOG") != nullptr;
     if (log_phase && streaming)

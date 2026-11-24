@@ -844,13 +844,7 @@ int cosyvoice_server_webui_run(server_runtime& runtime)
         // ---- Streaming path ----
         if (is_streaming)
         {
-            // Build WAV header ahead of time
-            std::string wav_header;
-            if (fmt == response_audio_format::wav)
-                build_wav_header(&wav_header, runtime.sample_rate);
-
             auto content_type = response_format_to_content_type(fmt);
-            bool has_wav = (fmt == response_audio_format::wav);
             // Copy shared state needed inside the provider.
             // The provider runs AFTER the route handler returns, so any
             // reference to local variables is dangling — capture by value only.
@@ -862,22 +856,11 @@ int cosyvoice_server_webui_run(server_runtime& runtime)
             auto conn_checker = req.is_connection_closed;  // copy the socket-checker function
 
             res.set_chunked_content_provider(content_type,
-                [&rt, vctx, text_copy, instr_copy, speed, mode, fmt, wav_header, has_wav, log_ctx_copy, applied_seed, conn_checker, tts_scope]
+                [&rt, vctx, text_copy, instr_copy, speed, mode, fmt, log_ctx_copy, applied_seed, conn_checker, tts_scope]
                 (size_t /*offset*/, DataSink& sink) -> bool
                 {
                     auto model_ctx = get_slot_model_context(rt, 0);
                     connection_monitor mon(conn_checker, rt.stop_pool, model_ctx);
-
-                    // Write WAV header first
-                    if (has_wav && !wav_header.empty())
-                    {
-                        if (!sink.write(wav_header.data(), wav_header.size()))
-                        {
-                            mon.join();
-                            sink.done();
-                            return true;
-                        }
-                    }
 
                     std::atomic<bool> aborted{false};
                     std::string stream_error;
@@ -890,7 +873,7 @@ int cosyvoice_server_webui_run(server_runtime& runtime)
 #endif
                     cb_ctx.format              = fmt;
                     cb_ctx.sample_rate         = rt.sample_rate;
-                    cb_ctx.wav_header_written  = has_wav;
+                    cb_ctx.wav_header_written  = false;
                     cb_ctx.error_out           = &stream_error;
                     cb_ctx.aborted             = &aborted;
 

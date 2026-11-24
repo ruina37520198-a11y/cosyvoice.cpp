@@ -1,5 +1,13 @@
 # CosyVoice.cpp
 
+## AiTable r2 for CosyVoice.cpp v0.2.1
+
+This branch publishes the native source changes in `0.2.1-aitable-instmask-seamfix-20261124` (revision r2), based on [upstream commit 81ce60c](https://github.com/Lourdle/cosyvoice.cpp/commit/81ce60cd682ff44b8ab4a9226c097b4aff64d1f6). The tested Windows configuration uses GGML b12359 and Vulkan on a Radeon RX 9070.
+
+During INSTRUCT synthesis, the TASK row and subsequent speech-token queries on layers 0–17 mask instruction-body keys. Upper layers retain access to style information. Explicit mode tracking and tokenizer-derived boundaries cover both high-level requests and low-level token arrays. ZERO_SHOT, CROSS_LINGUAL and active dynamic ASMR LoRA bypass the instruction mask. See [the model-backed boundary test](tests/inst-mask-boundaries.cpp) and [native test instructions](tests/README.md).
+
+Other changes include streaming mel handoff, deferred streaming WAV headers, generated/emitted token tracking, BALANCED KV fixes and Vulkan optimizations. This branch includes the combined changes. In a separate mask-only experiment on the base F16 model with a public reference, three fixed-seed replays avoided an instruction tail heard on the upstream build. One earlier sentence in the sequence lost its final question with the mask enabled on one seed. Evaluate complete utterances and style across target voices.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue.svg)]()
 [![GitHub Release](https://img.shields.io/github/v/release/Lourdle/cosyvoice.cpp)](https://github.com/Lourdle/cosyvoice.cpp/releases)

@@ -24,6 +24,14 @@ extern "C" {
 
 // ----------------------------------------------------------------------------
 // Enumerations
+// AiTable fixed rank-4/alpha-8 Q/V adapter. Caller verifies the exact base and
+// factor container before this typed boundary. Status: 0 ok, 1 busy, 2 incompatible,
+// 3 malformed/not-loaded, 4 allocation failed. Loading never enables the adapter.
+// Factors: layers 0..23, q then v, A[4,896] then B[out,4], row-major FP32.
+COSYVOICE_API int cosyvoice_lora_load_f32(struct cosyvoice_context* ctx, const float* factors, size_t count);
+COSYVOICE_API int cosyvoice_lora_set_enabled(struct cosyvoice_context* ctx, bool enabled);
+// State: 0 unloaded, 1 disabled, 2 enabled. generation changes only on a mode transition.
+COSYVOICE_API int cosyvoice_lora_state(struct cosyvoice_context* ctx, uint64_t* generation, size_t* bytes);
 // ----------------------------------------------------------------------------
 
 /**
@@ -920,6 +928,32 @@ COSYVOICE_API void cosyvoice_request_stop(cosyvoice_context_t ctx);
  * @note Returns immediately.
  */
 COSYVOICE_API bool cosyvoice_is_stop_requested(cosyvoice_context_t ctx);
+
+// Optional metadata observer. The caller owns callback data until generation
+// and all callbacks have ended; setting it never changes sampling or output.
+typedef struct cosyvoice_progress {
+    uint32_t stage, phase, worker, seed, thread_id;
+    uint64_t samples, accepted, rejected_streak, kv_length, clock_ms;
+    bool cancelled;
+} cosyvoice_progress_t;
+typedef void (*cosyvoice_progress_callback_t)(const cosyvoice_progress_t*, void*);
+COSYVOICE_API void cosyvoice_set_progress_callback(cosyvoice_context_t ctx,
+    cosyvoice_progress_callback_t callback, void* user_data);
+
+// Optional error-only statistics; call from this worker's progress observer or
+// while idle. The caller owns output and passes its version and buffer size.
+// This leaves the existing borrowed progress callback ABI unchanged.
+typedef struct cosyvoice_failure_stats {
+    uint32_t reason; // 0: none; 1: legacy silent resampling exhausted; 2: generation limit
+    uint32_t nucleus_positive, nucleus_non_silent, raw_non_silent_mass_ppb;
+    uint64_t rescue_draws;
+} cosyvoice_failure_stats_t;
+COSYVOICE_API bool cosyvoice_get_failure_stats(cosyvoice_context_t ctx,
+    uint32_t version, size_t output_size, cosyvoice_failure_stats_t* output);
+
+// AiTable request-scoped diagnostics. False means invalid level/context or busy worker.
+COSYVOICE_API bool cosyvoice_set_debug_level(cosyvoice_context_t ctx,uint32_t level);
+COSYVOICE_API uint32_t cosyvoice_get_debug_level(cosyvoice_context_t ctx);
 
 #ifdef __cplusplus
 }

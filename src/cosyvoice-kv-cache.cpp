@@ -3,6 +3,7 @@
 
 #include <ggml-backend.h>
 
+#include <algorithm>
 #include <utility>
 #include <span>
 #include <vector>
@@ -22,6 +23,8 @@ struct offloaded_kv_cache
 
     uint32_t len;
     std::vector<char> buffer;
+    ggml_backend_buffer_ptr pinned_buffer;
+    size_t pinned_capacity = 0;
     ggml_context* ctx;
     struct offloaded_kv_layer
     {
@@ -29,6 +32,46 @@ struct offloaded_kv_cache
         char* k;
         char* v;
     } offloaded_kv_layers[];
+
+    char* ensure_buffer(ggml_backend_t backend, size_t nbytes)
+    {
+        if (nbytes == 0) return nullptr;
+        if (pinned_buffer && pinned_capacity >= nbytes)
+            return reinterpret_cast<char*>(ggml_backend_buffer_get_base(pinned_buffer.get()));
+        if (backend)
+        {
+            if (auto dev = ggml_backend_get_device(backend))
+            {
+                if (auto host_buft = ggml_backend_dev_host_buffer_type(dev))
+                {
+                    const size_t alloc_bytes = std::max(nbytes, pinned_capacity * 2);
+                    if (auto buf = ggml_backend_buft_alloc_buffer(host_buft, alloc_bytes))
+                    {
+                        pinned_buffer.reset(buf);
+                        pinned_capacity = ggml_backend_buffer_get_size(buf);
+                        std::vector<char>().swap(buffer);
+                        return reinterpret_cast<char*>(ggml_backend_buffer_get_base(buf));
+                    }
+                }
+            }
+        }
+        pinned_buffer.reset();
+        pinned_capacity = 0;
+        buffer.resize(nbytes);
+        return buffer.data();
+    }
+
+    size_t buffer_capacity() const
+    {
+        return pinned_buffer ? pinned_capacity : buffer.capacity();
+    }
+
+    void release_buffer()
+    {
+        pinned_buffer.reset();
+        pinned_capacity = 0;
+        std::vector<char>().swap(buffer);
+    }
 };
 
 static constexpr size_t get_offloaded_kv_cache_struct_size(int layers)
@@ -153,8 +196,7 @@ void cosyvoice_kv_cache::offload_cache(ggml_backend_t backend, ggml_backend_sche
     const size_t kv_nbytes = (k_nbytes + v_nbytes) * batch_size;
 
     ggml_reset(offloaded_cache->ctx);
-    offloaded_cache->buffer.resize(kv_nbytes * layers);
-    char* buffer_base = offloaded_cache->buffer.data();
+    char* buffer_base = offloaded_cache->ensure_buffer(backend, kv_nbytes * layers);
 
     offloaded_cache->len = n_tokens;
     for (int i = 0; i != layers; ++i)
@@ -251,8 +293,8 @@ size_t cosyvoice_kv_cache::get_offloaded_cache_size() const
     {
         size_t nbytes = 0;
         auto object_size = get_offloaded_kv_cache_struct_size(layers);
-        for (auto i = 0; i != layers; ++i)
-            nbytes += advance_ptr(offloaded_cache, object_size)->buffer.capacity();
+        for (int i = 0; i != n_offloaded_kv_slots; ++i)
+            nbytes += advance_ptr(offloaded_cache, object_size * i)->buffer_capacity();
         return nbytes;
     }
     else return 0;
@@ -262,12 +304,14 @@ void cosyvoice_kv_cache::clear_offloaded_cache()
 {
     if (offloaded_cache)
     {
-        ggml_free(offloaded_cache->ctx);
         auto object_size = get_offloaded_kv_cache_struct_size(layers);
-        for (auto i = 0; i != layers; ++i)
+        // Invalidate each allocated offload slot; contexts remain owned until
+        // destruction and are reused by subsequent prefill/offload operations.
+        for (int i = 0; i != n_offloaded_kv_slots; ++i)
         {
-            auto cur = advance_ptr(offloaded_cache, object_size);
-            std::vector<char>().swap(cur->buffer);
+            auto cur = advance_ptr(offloaded_cache, object_size * i);
+            ggml_reset(cur->ctx);
+            cur->release_buffer();
             cur->len = 0;
         }
     }
@@ -435,14 +479,17 @@ void cosyvoice_kv_cache::slide_kv_slot()
             auto k_view = layer.k_view;
             next_layer.k_view = k_view;
             // permute node
+            k_view->buffer = k->buffer;
             k_view->data = k->data;
             k_view->view_src = k;
             k_view = k_view->src[0];
             // view node
+            k_view->buffer = k->buffer;
             k_view->data = k->data;
             k_view->view_src = k;
             k_view = k_view->src[0];
             // set_rows (writer) node
+            k_view->buffer = k->buffer;
             k_view->data = k->data;
             k_view->src[2] = k_view->view_src = k;
 
@@ -450,14 +497,17 @@ void cosyvoice_kv_cache::slide_kv_slot()
             auto v_view = layer.v_view;
             next_layer.v_view = v_view;
             // permute node
+            v_view->buffer = v->buffer;
             v_view->data = v->data;
             v_view->view_src = v;
             v_view = v_view->src[0];
             // view node
+            v_view->buffer = v->buffer;
             v_view->data = v->data;
             v_view->view_src = v;
             v_view = v_view->src[0];
             // set_rows (writer) node
+            v_view->buffer = v->buffer;
             v_view->data = v->data;
             v_view->src[2] = v_view->view_src = v;
         }

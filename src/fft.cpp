@@ -89,9 +89,9 @@ static void ggml_fft_op(struct ggml_tensor* dst, int ith, int nth, fft_context* 
     const auto signal_nb1 = signal->nb[1];
     const auto signal_ne1 = signal->ne[1];
 
-    ++ctx->workers;
-
-    for (int64_t i = ctx->idx++; i < signal_ne1; i = ctx->idx++)
+    const int64_t i0 = (signal_ne1 * ith) / nth;
+    const int64_t i1 = (signal_ne1 * (ith + 1)) / nth;
+    for (int64_t i = i0; i < i1; ++i)
     {
         const auto cur_offset = dst_nb1 * i;
         const auto cur_fouti = reinterpret_cast<float*>(fouti + cur_offset);
@@ -102,8 +102,66 @@ static void ggml_fft_op(struct ggml_tensor* dst, int ith, int nth, fft_context* 
             1, 1, ctx->factors,
             buffer_scratchr, buffer_scratchi, *ctx);
     }
+}
 
-    if (--ctx->workers == 0) ctx->idx = 0;
+static void ggml_stft_fused_op(struct ggml_tensor* dst, int ith, int nth, fft_context* ctx)
+{
+    const auto* signal = dst->src[0];
+    const auto* window = dst->src[1];
+    const auto* meta   = dst->src[2];
+    const int64_t hop_len = meta->op_params[4];
+    const int64_t pad     = meta->op_params[5];
+
+    const int nfft = ctx->nfft;
+    const int n_bins = nfft / 2 + 1;
+    const int64_t n_samples = signal->ne[0];
+    const int64_t n_frames  = dst->ne[0];
+
+    const float* sig_data = reinterpret_cast<const float*>(signal->data);
+    const float* win_data = reinterpret_cast<const float*>(window->data);
+    float* out_r = reinterpret_cast<float*>(dst->data);
+    float* out_i = reinterpret_cast<float*>(reinterpret_cast<char*>(dst->data) + dst->nb[2]);
+
+    float* win_frame = reinterpret_cast<float*>(alloca(sizeof(float) * (nfft * 3 + ctx->max_factor_value * 2)));
+    float* foutr = win_frame + nfft;
+    float* fouti = foutr + nfft;
+    float* scratchr = fouti + nfft;
+    float* scratchi = scratchr + ctx->max_factor_value;
+
+    const int64_t f0 = (n_frames * ith) / nth;
+    const int64_t f1 = (n_frames * (ith + 1)) / nth;
+    for (int64_t f = f0; f < f1; ++f)
+    {
+        const int64_t base = f * hop_len - pad;
+        if (base >= 0 && base + nfft <= n_samples)
+        {
+            const float* src = sig_data + base;
+            for (int k = 0; k < nfft; ++k)
+                win_frame[k] = src[k] * win_data[k];
+        }
+        else
+        {
+            for (int k = 0; k < nfft; ++k)
+            {
+                int64_t idx = base + k;
+                if (idx < 0)
+                    idx = -idx;
+                else if (idx >= n_samples)
+                    idx = 2 * (n_samples - 1) - idx;
+                win_frame[k] = sig_data[idx] * win_data[k];
+            }
+        }
+
+        memset(fouti, 0, sizeof(float) * nfft);
+        kf_work(foutr, fouti, win_frame, 1, 1, ctx->factors, scratchr, scratchi, *ctx);
+
+        for (int k = 0; k < n_bins; ++k)
+        {
+            const int64_t off = static_cast<int64_t>(k) * n_frames + f;
+            out_r[off] = foutr[k];
+            out_i[off] = fouti[k];
+        }
+    }
 }
 
 void delete_fft_context(fft_context* ctx)
@@ -144,17 +202,31 @@ ggml_tensor* ggml_stft(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b, int ho
     GGML_ASSERT(ggml_is_vector(b));
     GGML_ASSERT(ggml_is_contiguous(a));
 
-    if (center)
+    const auto win_size = b->ne[0];
+    const int pad_amount = center ? fctx->nfft / 2 : 0;
+    if (win_size == fctx->nfft && hop_len > 0 && (!center || a->ne[0] > pad_amount))
     {
-        const auto pad_amount = fctx->nfft / 2;
-        a = ggml_pad_reflect_1d(ctx, a, pad_amount, pad_amount);
+        const int64_t padded_len = a->ne[0] + 2 * pad_amount;
+        const int64_t n_frames = (padded_len - win_size) / hop_len + 1;
+        auto* meta = ggml_view_1d(ctx, b, 1, 0);
+        meta->op_params[4] = hop_len;
+        meta->op_params[5] = pad_amount;
+        ggml_set_cpu(meta);
+        ggml_tensor* args[] = { a, b, meta };
+        return ggml_custom_4d(
+            ctx, a->type, n_frames, fctx->nfft / 2 + 1, 2, 1,
+            args, 3,
+            reinterpret_cast<ggml_custom_op_t>(ggml_stft_fused_op),
+            GGML_N_TASKS_MAX, fctx);
     }
+
+    if (center)
+        a = ggml_pad_reflect_1d(ctx, a, pad_amount, pad_amount);
     else
         a = ggml_dup(ctx, a);
 
     ggml_set_cpu(a);
 
-    const auto win_size = b->ne[0];
     const auto n_frames = (a->ne[0] - win_size) / hop_len + 1;
 
     a = ggml_dup_inplace(ctx, a);
@@ -234,39 +306,68 @@ istft_context_ptr create_istft_context(int nfft, ggml_context* ctx, std::functio
 
 static void ggml_istft_finalize_op(struct ggml_tensor* dst, int ith, int nth, void* userdata)
 {
-    auto idx = dst->src[0];
-    auto idx_data = reinterpret_cast<int32_t*>(idx->data);
-    auto frames = reinterpret_cast<float*>(dst->src[1]->data);
-    auto w_sq = reinterpret_cast<float*>(dst->src[2]->data);
-    auto dst_data = reinterpret_cast<float*>(dst->data);
-    auto denom_data = reinterpret_cast<float*>(dst->src[3]->data);
+    static_assert(sizeof(uintptr_t) >= 8, "ggml_istft_finalize_op packs hop_len and offset into userdata");
+    const auto packed = reinterpret_cast<uintptr_t>(userdata);
+    const int64_t hop_len = static_cast<int64_t>(packed >> 32);
+    const int64_t offset  = static_cast<int64_t>(packed & 0xFFFFFFFFu);
 
-    const auto offset = userdata ? reinterpret_cast<intptr_t>(userdata) : 0;
-    const auto out_len = dst->ne[0];
-    auto win_len = dst->src[2]->ne[0];
+    auto* frames_t = dst->src[0];
+    auto* win_t    = dst->src[1];
+    auto* denom_t  = dst->src[2];
 
-    const auto begin = (out_len * ith) / nth;
-    const auto end = (out_len * (ith + 1)) / nth;
+    const float* frames = reinterpret_cast<const float*>(frames_t->data);
+    const float* win    = reinterpret_cast<const float*>(win_t->data);
+    float* dst_data     = reinterpret_cast<float*>(dst->data);
+    float* denom_data   = reinterpret_cast<float*>(denom_t->data);
 
-    memset(dst_data + begin, 0, (end - begin) * sizeof(float));
-    memset(denom_data + begin, 0, (end - begin) * sizeof(float));
-    const auto n = ggml_nelements(idx);
-    for (int64_t i = 0; i != n; ++i) {
-        const auto cur = idx_data[i] - offset;
-        if (cur < begin || cur >= end)
-            continue;
+    const int64_t out_len  = dst->ne[0];
+    const int64_t win_len  = win_t->ne[0];
+    const int64_t n_frames = frames_t->ne[1];
 
-        dst_data[cur] += frames[i];
-        denom_data[cur] += w_sq[i % win_len];
+    float* w_sq = reinterpret_cast<float*>(alloca(sizeof(float) * static_cast<size_t>(win_len)));
+    for (int64_t k = 0; k != win_len; ++k)
+        w_sq[k] = win[k] * win[k];
+
+    const int64_t begin = (out_len * ith) / nth;
+    const int64_t end   = (out_len * (ith + 1)) / nth;
+    if (begin >= end)
+        return;
+
+    memset(dst_data + begin, 0, static_cast<size_t>(end - begin) * sizeof(float));
+    memset(denom_data + begin, 0, static_cast<size_t>(end - begin) * sizeof(float));
+
+    const int64_t min_num = begin + offset - win_len + 1;
+    int64_t f_start = min_num > 0 ? (min_num / hop_len) : 0;
+    while (f_start > 0 && (f_start - 1) * hop_len + win_len - 1 - offset >= begin)
+        --f_start;
+    while (f_start < n_frames && f_start * hop_len + win_len - 1 - offset < begin)
+        ++f_start;
+
+    int64_t f_end = (end + offset - 1) >= 0 ? ((end + offset - 1) / hop_len + 1) : 0;
+    if (f_end > n_frames)
+        f_end = n_frames;
+
+    for (int64_t f = f_start; f < f_end; ++f)
+    {
+        const float* fr = frames + f * win_len;
+        const int64_t base = f * hop_len - offset;
+        const int64_t k0 = base < begin ? (begin - base) : 0;
+        const int64_t k1 = (base + win_len) > end ? (end - base) : win_len;
+        for (int64_t k = k0; k < k1; ++k)
+        {
+            dst_data[base + k] += fr[k];
+            denom_data[base + k] += w_sq[k];
+        }
     }
 
-    simd_dispatch<safe_divide_kernel>(dst_data + begin, denom_data + begin, end - begin, 1e-8f);
+    simd_dispatch<safe_divide_kernel>(dst_data + begin, denom_data + begin, static_cast<size_t>(end - begin), 1e-8f);
 }
 
 ggml_tensor* ggml_istft(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b, ggml_tensor* c, int hop_len, bool center, istft_context* ictx)
 {
     GGML_ASSERT(ggml_are_same_shape(a, b));
     GGML_ASSERT(a->ne[1] == ictx->nfft / 2 + 1);
+    GGML_ASSERT(hop_len > 0);
 
     a = ggml_cont(ctx, ggml_permute(ctx, a, 1, 0, 2, 3));
     b = ggml_cont(ctx, ggml_permute(ctx, b, 1, 0, 2, 3));
@@ -276,16 +377,9 @@ ggml_tensor* ggml_istft(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b, ggml_
         ggml_mul_mat(ctx, ictx->idft_imag, b));
     frames = ggml_mul(ctx, frames, c);
 
-    auto t_idx = ggml_arange(ctx, 0, static_cast<float>(b->ne[1] * hop_len), static_cast<float>(hop_len));
-    auto n_idx = ggml_arange(ctx, 0, static_cast<float>(ictx->nfft), 1.f);
-    t_idx = ggml_reshape_2d(ctx, t_idx, 1, t_idx->ne[0]);
-    t_idx = ggml_repeat_4d(ctx, t_idx, ictx->nfft, t_idx->ne[1], 1, 1);
-    n_idx = ggml_repeat_4d(ctx, n_idx, n_idx->ne[0], a->ne[1], 1, 1);
-    auto idx = ggml_add(ctx, t_idx, n_idx);
-    idx = ggml_cast(ctx, idx, GGML_TYPE_I32);
-
-    auto w_sq = ggml_mul(ctx, c, c);
     auto out_len_full = (b->ne[1] - 1) * hop_len + (center ? 0 : ictx->nfft);
-    ggml_tensor* args[] = { idx, frames, w_sq, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_len_full) };
-    return ggml_custom_4d(ctx, GGML_TYPE_F32, out_len_full, 1, 1, 1, args, 4, ggml_istft_finalize_op, GGML_N_TASKS_MAX, reinterpret_cast<void*>(intptr_t(center ? ictx->nfft / 2 : 0)));
+    const uintptr_t packed = (static_cast<uintptr_t>(static_cast<uint32_t>(hop_len)) << 32)
+        | static_cast<uintptr_t>(static_cast<uint32_t>(center ? ictx->nfft / 2 : 0));
+    ggml_tensor* args[] = { frames, c, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_len_full) };
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, out_len_full, 1, 1, 1, args, 3, ggml_istft_finalize_op, GGML_N_TASKS_MAX, reinterpret_cast<void*>(packed));
 }

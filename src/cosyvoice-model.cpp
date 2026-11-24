@@ -1,3 +1,4 @@
+#include "cosyvoice-diagnostics.h"
 #include "cosyvoice-model.h"
 #include "common.h"
 
@@ -166,7 +167,7 @@ cosyvoice_model::cosyvoice_model(ggml_backend_t backend, const cosyvoice_context
 
 bool cosyvoice_model::using_builtin_sampler() const
 {
-    return worker->sampler == reinterpret_cast<cosyvoice_sampler_t>(cosyvoice_llm_sampler);
+    return shared->params.sampler == reinterpret_cast<cosyvoice_sampler_t>(cosyvoice_llm_sampler);
 }
 
 bool cosyvoice_model::reset_builtin_sampler_rng()
@@ -510,11 +511,13 @@ int cosyvoice_model::llm_sample_token()
 void cosyvoice_model::llm_accept_token(int token)
 {
     worker->tokens.push_back(token);
+    worker->output_tokens.accept(token, false);
 }
 
 void cosyvoice_model::llm_clear_accepted_tokens()
 {
     worker->tokens.clear();
+    worker->output_tokens.clear();
 }
 
 uint32_t cosyvoice_model::llm_get_n_accepted_tokens()
@@ -560,13 +563,21 @@ void cosyvoice_model::request_stop()
     worker->stop_flag.store(true, std::memory_order_release);
     {
         std::unique_lock<std::mutex> lock(worker->cv_mutex);
+        aitable_tts_diag::mark(worker->diagnostic, "stop_wait_begin", static_cast<int>(worker->use_count.load(std::memory_order_acquire)), get_worker_no());
         worker->cv.wait(lock, [this]() {
             return worker->use_count.load(std::memory_order_acquire) == 0;
         });
+        aitable_tts_diag::mark(worker->diagnostic, "stop_wait_end", static_cast<int>(worker->use_count.load(std::memory_order_acquire)), get_worker_no());
     }
 
 cleanup:
     worker->offset = 0;
+    worker->flow_cache.clear();
+    worker->wav_offset = 0;
+    worker->emitted_mel_frames = 0;
+    worker->inst_mask_begin = 0;
+    worker->inst_mask_end = 0;
+    worker->chunk_boundaries.clear();
     worker->stop_flag.store(false, std::memory_order_release);
 }
 
@@ -605,4 +616,46 @@ void cosyvoice_model::llm_load_kv_cache()
     auto& kv_cache = worker->llm_kv_cache;
     ggml_backend_sched_reset(sched);
     kv_cache.load_cache(worker->backend.get(), sched);
+}
+
+#include <chrono>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
+
+void cosyvoice_model::set_progress_callback(cosyvoice_progress_callback_t callback, void* user_data)
+{
+    worker->progress_callback=callback;
+    worker->progress_user_data=user_data;
+    worker->progress={};
+    worker->failure_stats={};
+    worker->progress.worker=get_worker_no();
+    cosyvoice_report_progress(worker,1);
+}
+
+void cosyvoice_report_progress(cosyvoice_worker_context* worker, uint32_t stage, uint32_t phase) noexcept
+{
+    if (!worker->progress_callback) return;
+    auto& p=worker->progress;
+    p.stage=stage;
+    if (phase) p.phase=phase;
+    p.seed=worker->sampler_seed;
+    p.accepted=worker->tokens.size();
+    p.kv_length=worker->llm_kv_cache.cur_len;
+    p.cancelled=worker->stop_flag.load(std::memory_order_acquire);
+    p.clock_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#if defined(_WIN32)
+    p.thread_id=GetCurrentThreadId();
+#elif defined(__linux__)
+    p.thread_id=static_cast<uint32_t>(syscall(SYS_gettid));
+#else
+    p.thread_id=0;
+#endif
+    worker->progress_callback(&p,worker->progress_user_data);
 }

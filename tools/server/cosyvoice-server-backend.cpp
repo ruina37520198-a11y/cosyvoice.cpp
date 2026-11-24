@@ -6,6 +6,9 @@
 #endif
 
 #include <cmath>
+#include <fstream>
+#include <cstdlib>
+#include <chrono>
 #include <cstdint>
 #include <ctime>
 #include <format>
@@ -20,6 +23,23 @@ import nlohmann_json;
 #endif
 
 using json = nlohmann::json;
+#include "aitable-progress-server.h"
+static bool prepare_adapter(server_runtime&,cosyvoice_context_t,bool,Response&);
+// A provider may be discarded before its first callback. Keep slot ownership
+// until either execution finishes or httplib releases that provider, exactly once.
+struct adapter_stream_slot {
+    server_runtime& runtime;uint32_t slot;std::atomic<bool> active{true};
+    std::shared_ptr<aitable_progress::record> progress;
+    adapter_stream_slot(server_runtime& r,uint32_t s,std::shared_ptr<aitable_progress::record> p={}):runtime(r),slot(s),progress(std::move(p)){}
+    void release(){if(active.exchange(false)){
+        auto ctx=get_slot_model_context(runtime,slot);
+        aitable_progress::end(progress,ctx);
+        if(!cosyvoice_set_debug_level(ctx,0)) std::fputs("[AITABLE_DEBUG] worker_debug_cleanup_busy\n",stderr);
+        release_thread_slot(runtime,slot);
+    }}
+    ~adapter_stream_slot(){release();}
+};
+
 
 struct speech_request
 {
@@ -30,6 +50,7 @@ struct speech_request
     float speed = 1.0f;
     std::string instructions;
     bool has_instructions = false;
+    bool asmr_adapter = false;
 
     bool has_seed = false;
     uint32_t seed = 0;
@@ -331,6 +352,12 @@ static bool parse_speech_request_json(const json& body, speech_request* request,
         request->has_chunk_tokens = true;
     }
 
+    if (body.contains("asmr_adapter")) {
+        if (!body["asmr_adapter"].is_boolean()) {
+            set_openai_error(res,400,"asmr_adapter must be boolean","invalid_request_error","asmr_adapter","invalid_type");return false;
+        }
+        request->asmr_adapter=body["asmr_adapter"].get<bool>();
+    }
     const auto it_instructions = body.find("instructions");
     const auto it_instruction = body.find("instruction");
     if (it_instructions != body.end())
@@ -396,6 +423,7 @@ void cosyvoice_server_register_api_routes(Server& server, server_runtime& runtim
         res.status = 204;
     });
 
+    aitable_progress::route(server);
     server.Get("/healthz", [&](const Request&, Response& res)
     {
         json payload = {
@@ -403,6 +431,12 @@ void cosyvoice_server_register_api_routes(Server& server, server_runtime& runtim
             { "model", runtime.served_model_name },
             { "voices", runtime.voice_names }
         };
+        {
+            std::lock_guard lock(runtime.slot_mutex);
+            payload["active_synthesis_slots"]=std::count(runtime.slot_in_use.begin(),runtime.slot_in_use.end(),true);
+        }
+        payload["asmr_lora_protocol"]=1;
+        payload["aitable_debug_policy"]=1;
         res.status = 200;
         res.set_content(payload.dump(), "application/json");
     });
@@ -477,6 +511,9 @@ void cosyvoice_server_register_api_routes(Server& server, server_runtime& runtim
             return;
         }
 
+        if (request.asmr_adapter && (!request.has_instructions || request.instructions!="Please say a sentence in a very soft voice.")) {
+            set_openai_error(res,400,"ASMR requires the bound soft-voice preset","invalid_request_error","instructions","adapter_prompt_mismatch");return;
+        }
         fill_request_log_context_from_request(&log_ctx, request);
         log_request_details(runtime.log_level, log_ctx);
 
@@ -531,6 +568,14 @@ void cosyvoice_server_register_api_routes(Server& server, server_runtime& runtim
             return;
         }
 
+        const auto debug_header=req.get_header_value("X-AiTable-Debug-Level");
+        uint32_t debug_level=0;
+        if(!debug_header.empty()) {
+            if(debug_header.size()!=1 || debug_header[0]<'0' || debug_header[0]>'3') {
+                set_openai_error(res,400,"X-AiTable-Debug-Level must be 0..3","invalid_request_error",nullptr,"invalid_debug_level");return;
+            }
+            debug_level=static_cast<uint32_t>(debug_header[0]-'0');
+        }
         const uint32_t slot = acquire_thread_slot(runtime);
         if (slot == UINT32_MAX)
         {
@@ -549,6 +594,9 @@ void cosyvoice_server_register_api_routes(Server& server, server_runtime& runtim
             return;
         }
 
+        if (!prepare_adapter(runtime,model_ctx,request.asmr_adapter,res)) {
+            release_thread_slot(runtime,slot);return;
+        }
         std::string payload;
         std::string encoding_error;
         std::string generation_error;
@@ -572,6 +620,14 @@ void cosyvoice_server_register_api_routes(Server& server, server_runtime& runtim
             return;
         }
 
+        if(!cosyvoice_set_debug_level(model_ctx,debug_level)) {
+            release_thread_slot(runtime,slot);
+            set_openai_error(res,503,"Worker is not idle","server_error",nullptr,"worker_busy");return;
+        }
+        res.set_header("X-AiTable-Debug-Protocol","1");
+        res.set_header("X-AiTable-Debug-Level",std::to_string(debug_level));
+        auto progress=debug_level>=2 ? aitable_progress::begin(req,res,model_ctx,applied_seed) : std::shared_ptr<aitable_progress::record>{};
+        auto diagnostic_lease=std::make_shared<adapter_stream_slot>(runtime,slot,progress);
         const bool is_streaming = request.stream || runtime.stream;
 
         // ---- Streaming path ----
@@ -583,18 +639,13 @@ void cosyvoice_server_register_api_routes(Server& server, server_runtime& runtim
             if (ct > 0)
                 cosyvoice_set_chunk_tokens(model_ctx, ct);
 
-            // Build WAV header ahead of time (static header, sent before PCM data)
-            std::string wav_header;
-            if (format == response_audio_format::wav)
-                build_wav_header(&wav_header, runtime.sample_rate);
-
             auto content_type = response_format_to_content_type(format);
-            bool has_wav = (format == response_audio_format::wav);
 
             // Capture copies of resources needed inside the provider lambda.
             // IMPORTANT: the provider runs AFTER the route handler returns, so
             // any value captured by reference would be a dangling reference.
             // Capture by value or via raw pointers that outlive the handler.
+            auto lease=diagnostic_lease;
             auto& rt = runtime;
             auto* vctx = voice_ctx;
             auto log_ctx_copy = log_ctx;
@@ -602,23 +653,11 @@ void cosyvoice_server_register_api_routes(Server& server, server_runtime& runtim
             auto conn_checker = req.is_connection_closed;  // copy the socket-checker function
 
             res.set_chunked_content_provider(content_type,
-                [&rt, slot, req_copy, vctx, format, wav_header, has_wav, log_ctx_copy, applied_seed, conn_checker]
+                [&rt, slot, req_copy, vctx, format, log_ctx_copy, applied_seed, conn_checker, lease]
                 (size_t /*offset*/, DataSink& sink) -> bool
                 {
                     auto model_ctx = get_slot_model_context(rt, slot);
                     connection_monitor mon(conn_checker, rt.stop_pool, model_ctx);
-
-                    // Write WAV header first (for WAV output format)
-                    if (has_wav && !wav_header.empty())
-                    {
-                        if (!sink.write(wav_header.data(), wav_header.size()))
-                        {
-                            mon.join();
-                            release_thread_slot(rt, slot);
-                            sink.done();
-                            return true;
-                        }
-                    }
 
                     std::atomic<bool> aborted{false};
                     std::string stream_error;
@@ -631,7 +670,7 @@ void cosyvoice_server_register_api_routes(Server& server, server_runtime& runtim
 #endif
                     cb_ctx.format              = format;
                     cb_ctx.sample_rate         = rt.sample_rate;
-                    cb_ctx.wav_header_written  = has_wav;
+                    cb_ctx.wav_header_written  = false;
                     cb_ctx.error_out           = &stream_error;
                     cb_ctx.aborted             = &aborted;
 
@@ -650,13 +689,15 @@ void cosyvoice_server_register_api_routes(Server& server, server_runtime& runtim
                             req_copy.speed, stream_cb, &cb_ctx);
 
                     mon.join();
-                    release_thread_slot(rt, slot);
-                    sink.done();
+                    lease->release();
 
                     if (!ok && !aborted)
                     {
                         log_request_done(rt.log_level, log_ctx_copy,
                             request_log_status::failed, 200, applied_seed, 0, "stream_generation_failed");
+                        // No terminal chunk: a failed synthesis is not a complete
+                        // audio response, including when earlier PCM was sent.
+                        return false;
                     }
                     else
                     {
@@ -664,9 +705,10 @@ void cosyvoice_server_register_api_routes(Server& server, server_runtime& runtim
                             request_log_status::ok, 200, applied_seed, 0, "stream_speech");
                     }
 
+                    sink.done();
                     return true;
                 },
-                [](bool /*success*/) { /* resource releaser — no-op */ });
+                [lease](bool /*success*/) { lease->release(); });
 
             log_request_details(runtime.log_level, log_ctx);
             return;
@@ -690,7 +732,7 @@ void cosyvoice_server_register_api_routes(Server& server, server_runtime& runtim
 
             if (!ok || !generated.data || generated.length == 0)
             {
-                release_thread_slot(runtime, slot);
+                diagnostic_lease->release();
                 set_openai_error(res, 500, "TTS generation failed.", "server_error", nullptr, "generation_failed");
                 log_request_done(runtime.log_level, log_ctx, request_log_status::failed, res.status, applied_seed, res.body.size(), "generation_failed");
                 return;
@@ -698,18 +740,58 @@ void cosyvoice_server_register_api_routes(Server& server, server_runtime& runtim
 
             if (!build_audio_payload(format, generated, runtime, &payload, &encoding_error))
             {
-                release_thread_slot(runtime, slot);
+                diagnostic_lease->release();
                 set_openai_error(res, 500, encoding_error, "server_error", nullptr, "audio_encode_failed");
                 log_request_done(runtime.log_level, log_ctx, request_log_status::failed, res.status, applied_seed, res.body.size(), "audio_encode_failed");
                 return;
             }
 
-            release_thread_slot(runtime, slot);
+            diagnostic_lease->release();
             res.status = 200;
             res.set_content(std::move(payload), response_format_to_content_type(format));
             log_request_done(runtime.log_level, log_ctx, request_log_status::ok, res.status, applied_seed, res.body.size(), "speech");
         }
     });
+}
+
+// The host verifies the exact model/container before starting this owned
+// subprocess. Only this local startup path may select an adapter file; HTTP
+// clients select a mode, never a filesystem path or arbitrary weights.
+static bool prepare_adapter(server_runtime& rt,cosyvoice_context_t ctx,bool enabled,Response& res) {
+    const auto begin=std::chrono::steady_clock::now();
+    uint64_t generation=0;size_t bytes=0;
+    int state=cosyvoice_lora_state(ctx,&generation,&bytes);
+    if (enabled && rt.concurrency!=1) {
+        set_openai_error(res,400,"Adapter requires one owned synthesis slot","invalid_request_error","asmr_adapter","adapter_concurrency_unsupported");return false;
+    }
+    if(enabled && state==0) {
+        const char* path=std::getenv("AITABLE_COSY_ASMR_F32");
+        if(!path || !*path) {
+            set_openai_error(res,400,"No verified ASMR adapter configured","invalid_request_error","asmr_adapter","adapter_unavailable");return false;
+        }
+        std::ifstream file(path,std::ios::binary|std::ios::ate);
+        constexpr size_t size=270336*sizeof(float);
+        if(!file || file.tellg()!=size) {
+            set_openai_error(res,500,"Invalid ASMR factor container","server_error","asmr_adapter","adapter_container_invalid");return false;
+        }
+        std::vector<float> data(270336);file.seekg(0);file.read(reinterpret_cast<char*>(data.data()),size);
+        int status=file?cosyvoice_lora_load_f32(ctx,data.data(),data.size()):3;
+        if(status) {
+            set_openai_error(res,500,"ASMR adapter load failed","server_error","asmr_adapter","adapter_load_failed");return false;
+        }
+    }
+    // Do not change ordinary multi-slot servers with no configured adapter.
+    if(enabled || state!=0) {
+        if(cosyvoice_lora_set_enabled(ctx,enabled)!=0) {
+            set_openai_error(res,409,"ASMR adapter is busy or unavailable","server_error","asmr_adapter","adapter_switch_failed");return false;
+        }
+    }
+    state=cosyvoice_lora_state(ctx,&generation,&bytes);
+    res.set_header("X-AiTable-LoRA-State",state==2?"enabled":state==1?"disabled":"unloaded");
+    res.set_header("X-AiTable-LoRA-Generation",std::to_string(generation));
+    res.set_header("X-AiTable-LoRA-Bytes",std::to_string(bytes));
+    res.set_header("X-AiTable-LoRA-Switch-Microseconds",std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-begin).count()));
+    return true;
 }
 
 int cosyvoice_server_backend_run(server_runtime& runtime)

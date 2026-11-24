@@ -1,3 +1,4 @@
+#include "cosyvoice-diagnostics.h"
 #include "cosyvoice-internal.h"
 #include "cosyvoice-tokenizer.h"
 #include "cosyvoice-model.h"
@@ -27,8 +28,24 @@ uint32_t cosyvoice_generate_random_seed()
     return dist(gen);
 }
 
+// Nested LLM/Flow guards run on the same host thread as the outer TTS guard.
+// Share its reader rather than recursively locking std::shared_mutex.
+static thread_local std::vector<void*> adapter_readers;
+bool aitable_adapter_read_owned(void* owner) { return std::find(adapter_readers.begin(),adapter_readers.end(),owner)!=adapter_readers.end(); }
+void use_count_guard::protect_adapter(cosyvoice_model* model)
+{
+    auto owner = static_cast<void*>(model->shared);
+    if (std::find(adapter_readers.begin(), adapter_readers.end(), owner) == adapter_readers.end())
+    {
+        adapter_read = std::shared_lock(model->shared->adapter_mutex);
+        adapter_readers.push_back(owner);
+        adapter_owner = owner;
+    }
+}
+
 use_count_guard::use_count_guard(cosyvoice_model* model) : worker(model->worker)
 {
+    protect_adapter(model);
     worker->use_count.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -36,18 +53,22 @@ use_count_guard::use_count_guard(cosyvoice_context* ctx)
 {
     auto* model = dynamic_cast<cosyvoice_model*>(ctx);
     worker = model->worker;
+    protect_adapter(model);
     if(worker->use_count.load(std::memory_order_acquire) != 0)
     {
         std::unique_lock<std::mutex> lock(worker->cv_mutex);
+        aitable_tts_diag::mark(worker->diagnostic, "guard_wait_begin", static_cast<int>(worker->use_count.load(std::memory_order_acquire)), model->get_worker_no());
         worker->cv.wait(lock, [this]() {
             return worker->use_count.load(std::memory_order_acquire) == 0;
         });
+        aitable_tts_diag::mark(worker->diagnostic, "guard_wait_end", static_cast<int>(worker->use_count.load(std::memory_order_acquire)), model->get_worker_no());
     }
     worker->use_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 use_count_guard::~use_count_guard()
 {
+    if (adapter_owner) adapter_readers.pop_back();
     if (worker->use_count.fetch_sub(1, std::memory_order_release) == 1)
         worker->cv.notify_all();
 }
@@ -209,6 +230,14 @@ cosyvoice_context_t cosyvoice_load_ext(const void* data, size_t size, const cosy
         );
         ctx->cosyvoice_model_3::load(loader);
         ctx->cosyvoice_tokenizer::load(loader);
+        if (const char* prefix = ctx->get_instruction_prefix(); prefix && *prefix)
+            ctx->cosyvoice_vocab::tokenize(prefix, ctx->shared->instruction_prefix_tokens, false);
+        {
+            std::vector<int> eop_tokens;
+            ctx->cosyvoice_vocab::tokenize("<|endofprompt|>", eop_tokens, true);
+            if (eop_tokens.size() == 1)
+                ctx->shared->endofprompt_token_id = eop_tokens[0];
+        }
 
         auto ggml_backend_set_n_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(ggml_backend_get_device(ctx->worker->cpu_backend.get())), "ggml_backend_set_n_threads"));
         if (n_threads == 0)
@@ -421,6 +450,15 @@ const int* cosyvoice_llm_get_accepted_tokens(cosyvoice_context_t ctx)
     return ctx->llm_get_accepted_tokens();
 }
 
+uint32_t cosyvoice_llm_get_n_emitted_tokens(cosyvoice_context_t ctx)
+{
+    return static_cast<uint32_t>(dynamic_cast<cosyvoice_model*>(ctx)->worker->output_tokens.tokens.size());
+}
+const int* cosyvoice_llm_get_emitted_tokens(cosyvoice_context_t ctx)
+{
+    return dynamic_cast<cosyvoice_model*>(ctx)->worker->output_tokens.tokens.data();
+}
+
 bool cosyvoice_llm_job(cosyvoice_context_t ctx, const int* text, uint32_t text_len, cosyvoice_prompt_t prompt)
 {
     return ctx->llm_job(text, text_len, prompt);
@@ -478,7 +516,7 @@ bool cosyvoice_tts(cosyvoice_context_t ctx, const int* text, uint32_t text_len, 
     }
 
     if (ctx->llm_job(text, text_len, prompt)
-        && ctx->token2wav(ctx->llm_get_accepted_tokens(), ctx->llm_get_n_accepted_tokens(), speed, prompt, result))
+        && ctx->token2wav(cosyvoice_llm_get_emitted_tokens(ctx), cosyvoice_llm_get_n_emitted_tokens(ctx), speed, prompt, result))
     {
         // Check if stop was requested during token2wav
         if (ctx->is_stop_requested())
@@ -509,27 +547,30 @@ bool cosyvoice_tts_stream(cosyvoice_context_t ctx, const int* text, uint32_t tex
         ctx->llm_clear_accepted_tokens();
         uint32_t n_tokens = 0;
         bool final = false;
-        do
+        for (;;)
         {
             const auto chunk_tokens = ctx->get_chunk_tokens();
-
-            if (ctx->is_stop_requested())
-                return false;
-
-            if (!final)
-                if (!ctx->llm_job_ext(text, text_len, prompt, chunk_tokens + 1, &final))
-                    goto cleanup;
-
-            n_tokens = std::min(n_tokens + chunk_tokens, ctx->llm_get_n_accepted_tokens());
-
+            // Hold emitted lookahead even when filtered silence consumed a whole
+            // generation quota. Generated progress is bounded by the text maximum.
+            while (!final && static_cast<uint64_t>(cosyvoice_llm_get_n_emitted_tokens(ctx)) <
+                    static_cast<uint64_t>(n_tokens) + chunk_tokens + 1)
+            {
+                if (ctx->is_stop_requested()) return false;
+                if (!ctx->llm_job_ext(text, text_len, prompt, chunk_tokens + 1, &final)) goto cleanup;
+            }
+            if (ctx->is_stop_requested()) return false;
+            const auto total = cosyvoice_llm_get_n_emitted_tokens(ctx);
+            n_tokens = std::min(n_tokens + chunk_tokens, total);
+            if (n_tokens == 0) goto cleanup; // no synthetic zero-PCM completion
+            const bool finalize = final && n_tokens == total;
             cosyvoice_generated_speech result = {};
-            if (!ctx->token2wav_ext(ctx->llm_get_accepted_tokens(), n_tokens, speed, prompt, true, ctx->llm_get_n_accepted_tokens() == n_tokens, &result))
+            if (!ctx->token2wav_ext(cosyvoice_llm_get_emitted_tokens(ctx), n_tokens, speed, prompt, true, finalize, &result))
                 goto cleanup;
-
             if (result.data && result.length > 0
-                && !callback(result.data, result.length, user_data))
+                && (aitable_tts_diag::mark(dynamic_cast<cosyvoice_model*>(ctx)->worker->diagnostic, "pcm_callback"), !callback(result.data, result.length, user_data)))
                 goto cleanup;
-        } while (n_tokens != ctx->llm_get_n_accepted_tokens());
+            if (finalize) break;
+        }
 
         return true;
 
@@ -778,4 +819,32 @@ bool cosyvoice_save_wav(const char* filename, const float* data, uint32_t data_l
     f.write(reinterpret_cast<const char*>(&header), static_cast<std::streamsize>(sizeof(header)));
     f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(sizeof(float) * data_len));
     return f.good();
+}
+
+void cosyvoice_set_progress_callback(cosyvoice_context_t ctx, cosyvoice_progress_callback_t callback, void* user_data)
+{
+    dynamic_cast<cosyvoice_model*>(ctx)->set_progress_callback(callback,user_data);
+}
+
+bool cosyvoice_get_failure_stats(cosyvoice_context_t ctx, uint32_t version,
+    size_t output_size, cosyvoice_failure_stats_t* output)
+{
+    auto* model=dynamic_cast<cosyvoice_model*>(ctx);
+    if (!model || !model->worker || version!=1 || !output || output_size<sizeof(*output)) return false;
+    *output=model->worker->failure_stats;
+    return true;
+}
+
+// Set only while this worker is idle; the server's slot lease owns the level.
+bool cosyvoice_set_debug_level(cosyvoice_context_t ctx,uint32_t level)
+{
+    auto* model=dynamic_cast<cosyvoice_model*>(ctx);
+    if (!model || !model->worker || level>3 || model->worker->use_count.load(std::memory_order_acquire)!=0) return false;
+    model->worker->diagnostic.configure(level);
+    return true;
+}
+uint32_t cosyvoice_get_debug_level(cosyvoice_context_t ctx)
+{
+    auto* model=dynamic_cast<cosyvoice_model*>(ctx);
+    return model && model->worker ? model->worker->diagnostic.level.load(std::memory_order_acquire) : UINT32_MAX;
 }

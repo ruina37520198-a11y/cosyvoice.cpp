@@ -129,6 +129,7 @@ cosyvoice_prompt_t cosyvoice_prompt_init_from_prompt_speech(cosyvoice_context_t 
     prompt->prompt_speech_feat = prompt_speech->feat;
     prompt->llm_embedding = prompt_speech->embedding;
     prompt->flow_embedding = prompt_speech->embedding;
+    prompt->mode = COSYVOICE_INFERENCE_MODE_ZERO_SHOT;
     return prompt;
 }
 
@@ -194,13 +195,16 @@ void cosyvoice_model::set_prompt(cosyvoice_prompt_t prompt, cosyvoice_inference_
     switch (mode)
     {
     case COSYVOICE_INFERENCE_MODE_ZERO_SHOT:
+        prompt->mode = mode;
         prompt->llm_prompt_speech_tokens = prompt->flow_prompt_speech_tokens;
         break;
     case COSYVOICE_INFERENCE_MODE_CROSS_LINGUAL:
     case COSYVOICE_INFERENCE_MODE_INSTRUCT:
+        prompt->mode = mode;
         prompt->prompt_text.resize(instruction_length);
         prompt->llm_prompt_speech_tokens.first.reset();
         prompt->llm_prompt_speech_tokens.second = 0;
+        break;
     case COSYVOICE_INFERENCE_MODE_NULL:
         break;
     default:

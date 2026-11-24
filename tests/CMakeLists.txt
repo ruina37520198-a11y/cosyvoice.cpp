@@ -5,3 +5,7 @@ target_include_directories(test-llm-graph-reuse PRIVATE ../include)
 add_executable(test-tts-stream tts-stream.cpp)
 target_link_libraries(test-tts-stream PRIVATE cosyvoice common tools_common ggml)
 target_include_directories(test-tts-stream PRIVATE ../include)
+
+add_executable(test-inst-mask-boundaries inst-mask-boundaries.cpp)
+target_link_libraries(test-inst-mask-boundaries PRIVATE cosyvoice common tools_common ggml)
+target_include_directories(test-inst-mask-boundaries PRIVATE ../include)

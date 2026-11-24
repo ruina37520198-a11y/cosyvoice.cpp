@@ -537,18 +537,28 @@ bool stream_audio_chunk(streaming_callback_context* ctx, const float* pcm, uint3
     constexpr size_t kBytesPerSample = sizeof(int16_t);
     const size_t chunk_bytes = static_cast<size_t>(n_samples) * kBytesPerSample;
 
-    // PCM or WAV: convert float -> int16 and write raw PCM16
+    // PCM or WAV: convert float -> int16 and write raw PCM16.
+    // For WAV, emit the 44-byte RIFF header atomically with the first audio chunk
+    // so a stream that fails before producing PCM writes zero bytes.
     if (ctx->format == response_audio_format::pcm ||
         ctx->format == response_audio_format::wav)
     {
-        // WAV format: PCM16 data written after the header already sent
         std::string buf;
-        buf.resize(chunk_bytes);
+        if (ctx->format == response_audio_format::wav && !ctx->wav_header_written)
+        {
+            if (!build_wav_header(&buf, ctx->sample_rate))
+            {
+                if (ctx->error_out) *ctx->error_out = "Failed to build WAV header.";
+                return false;
+            }
+        }
+        const size_t header_bytes = buf.size();
+        buf.resize(header_bytes + chunk_bytes);
         for (uint32_t i = 0; i < n_samples; ++i)
         {
             const auto sample = float_to_pcm16(pcm[i]);
-            buf[2 * i]     = static_cast<char>(sample & 0xFF);
-            buf[2 * i + 1] = static_cast<char>((sample >> 8) & 0xFF);
+            buf[header_bytes + 2 * i]     = static_cast<char>(sample & 0xFF);
+            buf[header_bytes + 2 * i + 1] = static_cast<char>((sample >> 8) & 0xFF);
         }
 
         if (!ctx->sink->write(buf.data(), buf.size()))
@@ -556,6 +566,8 @@ bool stream_audio_chunk(streaming_callback_context* ctx, const float* pcm, uint3
             if (ctx->aborted) *ctx->aborted = true;
             return false;
         }
+        if (header_bytes != 0)
+            ctx->wav_header_written = true;
         return true;
     }
 

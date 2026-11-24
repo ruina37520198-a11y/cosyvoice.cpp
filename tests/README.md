@@ -123,3 +123,22 @@ build/bin/test-tts-stream CosyVoice3-2512_F32.gguf CUDA0 14 out \
 build/bin/test-tts-stream CosyVoice3-2512_Q4_K_M.gguf CPU 28 out \
     "Hello world." - "" 1.0 42 0 8 no-save
 ```
+
+## `test-inst-mask-boundaries`
+
+Model-backed low-level API regression for `INSTRUCT` instruction-body attention
+isolation and device weight buffer sizing. It exercises `cosyvoice_prompt_set_ext()`
+directly on the same worker under both `BALANCED` and `DEDICATED` buffer policies:
+
+- Mode switching (`INSTRUCT` ↔ `CROSS_LINGUAL` ↔ `ZERO_SHOT`) with identical
+  prompt tokens, verifying `CROSS_LINGUAL` remains unmasked and switching back
+  restores bit-consistent next-token distributions.
+- Prompts with and without a trailing `<|endofprompt|>` token (including a
+  single-token instruction body with and without `instruction_prefix`, and an
+  empty `[prefix, <|endofprompt|>]` prompt that must stay unmasked).
+- Device weight buffer packing with `n_max_seq=4096, n_workers=2` without an
+  unexpected multi-buffer spill on large-VRAM backends.
+
+```sh
+build/bin/test-inst-mask-boundaries /path/to/CosyVoice3-2512_F16.gguf Vulkan0 /path/to/prompt_speech.gguf
+```

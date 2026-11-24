@@ -1,3 +1,4 @@
+#include <shared_mutex>
 #pragma once
 
 #if defined(_WIN32) && !defined(COSYVOICE_STATIC)
@@ -139,6 +140,7 @@ struct cosyvoice_prompt
     matrix prompt_speech_feat;
     matrix llm_embedding;
     matrix flow_embedding;
+    cosyvoice_inference_mode_t mode = COSYVOICE_INFERENCE_MODE_ZERO_SHOT;
 
     uint32_t prompt_crc32;
     void calculate_crc32();
@@ -150,6 +152,9 @@ struct cosyvoice_model;
 struct use_count_guard
 {
     cosyvoice_worker_context* worker;
+    void* adapter_owner = nullptr;
+    std::shared_lock<std::shared_mutex> adapter_read;
+    void protect_adapter(cosyvoice_model* model);
 
     use_count_guard(cosyvoice_context* ctx);
     use_count_guard(cosyvoice_model* model);

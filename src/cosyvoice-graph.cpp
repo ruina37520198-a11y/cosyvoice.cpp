@@ -1,7 +1,9 @@
+#include "cosyvoice-hift-capture.h"
 #include "cosyvoice-model.h"
 #include "ggml-fft.h"
 #include "ggml-cpu-flag.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <span>
 
@@ -148,22 +150,16 @@ ggml_tensor* Conv1d::build_cgraph(ggml_context* ctx, ggml_tensor* x, int s, int 
     {
         GGML_ASSERT(weight->ne[2] % g == 0 && weight->ne[1] * g == x->ne[1]);
 
-        auto xs = reinterpret_cast<ggml_tensor**>(alloca(sizeof(ggml_tensor*) * g));
-        auto ws = reinterpret_cast<ggml_tensor**>(alloca(sizeof(ggml_tensor*) * g));
-        if (needs_f32_fallback && weight->type == GGML_TYPE_F16)
-            weight = ggml_cast(ctx, weight, GGML_TYPE_F32);
-        split_tensor(ctx, x, 1, xs, g);
-        split_tensor(ctx, weight, 2, ws, g);
-        const auto out_type = needs_f32_fallback ? GGML_TYPE_F32 : weight->type;
-        for (int i = 0; i != g; i++)
-            xs[i] = unsqueeze(ctx,
-                ggml_im2col(ctx,
-                    ws[i],
-                    ggml_cont(ctx, xs[i]),
-                    s, 0, p, 0, d, 0,
-                    false, out_type),
-                2);
-        im2col = concat_tensors(ctx, xs, g, 2, capabilities);
+        if (!ggml_is_contiguous(x))
+            x = ggml_cont(ctx, x);
+        const auto out_type = needs_f32_fallback
+            ? ((weight->type == GGML_TYPE_F16) ? GGML_TYPE_F16 : GGML_TYPE_F32)
+            : weight->type;
+        // Pack groups along the batch dimension so all g groups run in a single
+        // im2col kernel instead of g separate cont + im2col + concat copies.
+        auto x_grouped = ggml_reshape_3d(ctx, x, x->ne[0], weight->ne[1], g * x->ne[2]);
+        im2col = ggml_im2col(ctx, weight, x_grouped, s, 0, p, 0, d, 0, false, out_type);
+        im2col = ggml_reshape_4d(ctx, im2col, im2col->ne[0], im2col->ne[1], g, x->ne[2]);
     }
     else
     {
@@ -233,6 +229,11 @@ ggml_tensor* Conv1d::build_cgraph(ggml_context* ctx, ggml_tensor* x, int s, int 
             weight = ggml_repeat_4d(ctx, weight, weight->ne[0], weight->ne[1], g, x->ne[2]);
 
     ggml_tensor* result = ggml_mul_mat(ctx, im2col, weight);
+    if (g != 1)
+        // Preserve F32 accumulation across large grouped conv reduction K (e.g. 1984 in DiT
+        // CausalConvPositionEmbedding): F16 accumulation introduces audible mel/F0 drift,
+        // while F32 accumulation matches the F32 im2col path bit-for-bit on Vulkan coopmat1.
+        ggml_prec_set_acc(result, GGML_PREC_F32);
     result = ggml_reshape_3d(ctx, result, im2col->ne[1], this->weight->ne[2], x->ne[2]);
 
     if (bias)
@@ -244,6 +245,9 @@ ggml_tensor* Conv1d::build_cgraph(ggml_context* ctx, ggml_tensor* x, int s, int 
 ggml_tensor* Linear::build_cgraph(ggml_context* ctx, ggml_tensor* x) const
 {
     auto out = ggml_mul_mat(ctx, weight, x);
+    if (lora_enabled && *lora_enabled)
+        out = ggml_add(ctx, out, ggml_scale(ctx,
+            ggml_mul_mat(ctx, lora_b, ggml_mul_mat(ctx, lora_a, x)), 2.f * 0.95f));
     if (bias)
         out = ggml_add(ctx, out, bias);
     return out;
@@ -308,7 +312,6 @@ ggml_tensor* TimestepEmbedding::build_cgraph(ggml_context* ctx, ggml_tensor* t) 
 
 std::array<ggml_tensor*, 5> AdaLayerNormZero::build_cgraph(ggml_context* ctx, ggml_tensor* x, ggml_tensor* emb) const
 {
-    emb = ggml_silu(ctx, emb);
     emb = linear.build_cgraph(ctx, emb);
     auto [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp] = split_tensor<6>(ctx, emb, 0);
 
@@ -321,6 +324,14 @@ std::array<ggml_tensor*, 5> AdaLayerNormZero::build_cgraph(ggml_context* ctx, gg
     x = ggml_add(ctx, x, shift_msa);
 
     return { x, gate_msa, shift_mlp, scale_mlp, gate_mlp };
+}
+
+ggml_tensor* AdaLayerNormZero::build_cgraph_precomputed(ggml_context* ctx, ggml_tensor* x, ggml_tensor* shift_msa, ggml_tensor* scale_msa_p1) const
+{
+    x = norm.build_cgraph(ctx, x);
+    x = ggml_mul(ctx, x, scale_msa_p1);
+    x = ggml_add(ctx, x, shift_msa);
+    return x;
 }
 
 ggml_tensor* Attention::build_cgraph(ggml_context* ctx, ggml_tensor* x, ggml_tensor* position_ids, int64_t cut_len, cosyvoice_kv_cache* kv_cache, ggml_cgraph* gf, ggml_tensor* attn_mask, int layer_idx) const
@@ -347,6 +358,7 @@ ggml_tensor* Attention::build_cgraph(ggml_context* ctx, ggml_tensor* x, ggml_ten
     // 3D with an explicit single-head dimension first.
     query = ggml_reshape_3d(ctx, query, query->ne[0], 1, seq_len * batch_size);
     key = ggml_reshape_3d(ctx, key, key->ne[0], 1, full_seq_len * batch_size);
+
     position_ids = ggml_reshape_1d(ctx, position_ids, seq_len * batch_size);
     full_position_ids = ggml_reshape_1d(ctx, full_position_ids, full_seq_len * batch_size);
 
@@ -354,9 +366,19 @@ ggml_tensor* Attention::build_cgraph(ggml_context* ctx, ggml_tensor* x, ggml_ten
     query = ggml_rope(ctx, query, position_ids, head_dim, GGML_ROPE_TYPE_NORMAL);
     key = ggml_rope(ctx, key, full_position_ids, head_dim, GGML_ROPE_TYPE_NORMAL);
 
+    int64_t kv_len = full_seq_len;
+    if (!kv_cache && fattn && attn_mask && attn_mask->ne[0] > full_seq_len)
+    {
+        const int pad_kv = static_cast<int>(attn_mask->ne[0] - full_seq_len);
+        key = ggml_reshape_3d(ctx, key, key->ne[0], full_seq_len, batch_size);
+        key = ggml_pad(ctx, key, 0, pad_kv, 0, 0);
+        value = ggml_pad(ctx, value, 0, pad_kv, 0, 0);
+        kv_len = attn_mask->ne[0];
+    }
+
     query = ggml_reshape_4d(ctx, query, head_dim, heads, seq_len, batch_size);
-    key = ggml_reshape_4d(ctx, key, head_dim, heads, full_seq_len, batch_size);
-    value = ggml_reshape_4d(ctx, value, value->ne[0] / heads, heads, full_seq_len, batch_size);
+    key = ggml_reshape_4d(ctx, key, head_dim, heads, kv_len, batch_size);
+    value = ggml_reshape_4d(ctx, value, value->ne[0] / heads, heads, kv_len, batch_size);
 
     ggml_tensor* attn_output;
     query = ggml_permute(ctx, query, 0, 2, 1, 3);
@@ -427,9 +449,31 @@ ggml_tensor* DiTBlock::build_cgraph(ggml_context* ctx, ggml_tensor* x, ggml_tens
     return x;
 }
 
+ggml_tensor* DiTBlock::build_cgraph_precomputed(ggml_context* ctx, ggml_tensor* x,
+    ggml_tensor* shift_msa, ggml_tensor* scale_msa_p1, ggml_tensor* gate_msa,
+    ggml_tensor* shift_mlp, ggml_tensor* scale_mlp_p1, ggml_tensor* gate_mlp,
+    ggml_tensor* position_ids, int64_t cut_len, cosyvoice_kv_cache* kv_cache, ggml_cgraph* gf, ggml_tensor* attn_mask, int layer_idx) const
+{
+    auto norm = attn_norm.build_cgraph_precomputed(ctx, x, shift_msa, scale_msa_p1);
+
+    auto attn_output = attn.build_cgraph(ctx, norm, position_ids, cut_len, kv_cache, gf, attn_mask, layer_idx);
+    attn_output = ggml_mul(ctx, attn_output, gate_msa);
+    if (cut_len > 0)
+        x = ggml_view_3d(ctx, x, x->ne[0], x->ne[1] - cut_len, x->ne[2], x->nb[1], x->nb[2], x->nb[1] * cut_len);
+    x = ggml_add(ctx, x, attn_output);
+
+    auto ff_norm = this->ff_norm.build_cgraph(ctx, x);
+    ff_norm = ggml_mul(ctx, ff_norm, scale_mlp_p1);
+    ff_norm = ggml_add(ctx, ff_norm, shift_mlp);
+
+    auto ff_output = ff.build_cgraph(ctx, ff_norm);
+    ff_output = ggml_mul(ctx, ff_output, gate_mlp);
+    x = ggml_add(ctx, x, ff_output);
+    return x;
+}
+
 ggml_tensor* AdaLayerNorm_Final::build_cgraph(ggml_context* ctx, ggml_tensor* x, ggml_tensor* emb) const
 {
-    emb = ggml_silu(ctx, emb);
     emb = linear.build_cgraph(ctx, emb);
     auto [scale, shift] = split_tensor<2>(ctx, emb, 0);
 
@@ -440,31 +484,100 @@ ggml_tensor* AdaLayerNorm_Final::build_cgraph(ggml_context* ctx, ggml_tensor* x,
     return x;
 }
 
-ggml_tensor* DiT::build_cgraph(ggml_context* ctx, ggml_tensor* x, ggml_tensor* mu, ggml_tensor* t, ggml_tensor* spks, ggml_tensor* cond, int64_t cut_len, ggml_tensor*& ref_position_ids, ggml_backend_op_capabilities capabilities, cosyvoice_kv_cache* kv_cache, ggml_tensor** attn_mask, ggml_cgraph* gf) const
+ggml_tensor* AdaLayerNorm_Final::build_cgraph_precomputed(ggml_context* ctx, ggml_tensor* x, ggml_tensor* scale_p1, ggml_tensor* shift) const
 {
-    t = time_embed.build_cgraph(ctx, t);
+    x = norm.build_cgraph(ctx, x);
+    x = ggml_mul(ctx, x, scale_p1);
+    x = ggml_add(ctx, x, shift);
+    return x;
+}
+
+ggml_tensor* DiT::build_cgraph(ggml_context* ctx, ggml_tensor* x, ggml_tensor* mu, ggml_tensor* t, ggml_tensor* spks, ggml_tensor* cond, int64_t cut_len, ggml_tensor*& ref_position_ids, ggml_backend_op_capabilities capabilities, cosyvoice_kv_cache* kv_cache, ggml_tensor** attn_mask, ggml_cgraph* gf, int step_idx, DiTModulationHandle* adaln_handle) const
+{
+    const bool use_precomputed = adaln_table != nullptr && adaln_handle != nullptr
+        && step_idx >= 0 && step_idx < adaln_table->ne[2];
+    if (adaln_handle)
+    {
+        adaln_handle->step_base = nullptr;
+        adaln_handle->views.clear();
+    }
+
+    ggml_tensor* adaln_step = nullptr;
+    if (use_precomputed)
+    {
+        adaln_step = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, adaln_table->ne[0], adaln_table->ne[1]);
+        adaln_step->buffer = adaln_table->buffer;
+        adaln_step->data = static_cast<char*>(adaln_table->data) + static_cast<size_t>(step_idx) * adaln_table->nb[2];
+        adaln_handle->step_base = adaln_step;
+        adaln_handle->views.reserve(static_cast<size_t>(adaln_table->ne[1]));
+    }
+    else
+    {
+        t = time_embed.build_cgraph(ctx, t);
+        t = ggml_silu(ctx, t);
+    }
+
+    auto make_mod_vec = [&](int64_t row) -> ggml_tensor*
+    {
+        auto* v = ggml_view_4d(ctx, adaln_step, adaln_step->ne[0], 1, 1, 1,
+            adaln_step->nb[1], adaln_step->nb[1], adaln_step->nb[1],
+            static_cast<size_t>(row) * adaln_step->nb[1]);
+        v->buffer = adaln_step->buffer;
+        v->data = static_cast<char*>(adaln_step->data) + v->view_offs;
+        adaln_handle->views.push_back(v);
+        return v;
+    };
+
     x = input_embed.build_cgraph(ctx, x, cond, mu, spks, capabilities);
 
     ggml_tensor* position_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, x->ne[1], x->ne[2]);
-    ggml_set_input(position_ids);
+    ggml_set_output(position_ids);
     ref_position_ids = position_ids;
-    position_ids = ggml_dup(ctx, position_ids);
 
     ggml_tensor* mask = nullptr;
     if (attn_mask)
     {
         const auto seq_len = x->ne[1];
-        mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, seq_len, seq_len);
-        ggml_set_input(mask);
+        int64_t kv_len = seq_len;
+        int64_t q_rows = seq_len;
+        // Unlock Vulkan flash_attn_cm1 mask_opt (requires nem0 >= 64*16 = 1024)
+        // and 64-aligned KV fast path when streaming block-causal mask is active.
+        constexpr int64_t kMaskOptPadMinSeq = 768;
+        if (!kv_cache && !transformer_blocks.empty() && transformer_blocks[0].attn.fattn
+            && seq_len >= kMaskOptPadMinSeq)
+        {
+            kv_len = std::max<int64_t>(1024, (seq_len + 63) & ~int64_t(63));
+            q_rows = (seq_len + 15) & ~int64_t(15);
+        }
+        mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_len, q_rows);
+        ggml_set_output(mask);
         *attn_mask = mask;
     }
 
-    for (int i = 0; i < transformer_blocks.size() - 1; ++i)
-        x = transformer_blocks[i].build_cgraph(ctx, x, t, position_ids, 0, kv_cache, gf, mask, i);
-    // Apply `cut_len` only on the final block.
-    x = transformer_blocks.back().build_cgraph(ctx, x, t, position_ids, cut_len, kv_cache, gf, mask, static_cast<int>(transformer_blocks.size()) - 1);
+    if (use_precomputed)
+    {
+        const auto depth = transformer_blocks.size();
+        for (size_t i = 0; i < depth; ++i)
+        {
+            const int64_t r = static_cast<int64_t>(i * 6);
+            const int64_t block_cut = (i + 1 == depth) ? cut_len : 0;
+            x = transformer_blocks[i].build_cgraph_precomputed(ctx, x,
+                make_mod_vec(r + 0), make_mod_vec(r + 1), make_mod_vec(r + 2),
+                make_mod_vec(r + 3), make_mod_vec(r + 4), make_mod_vec(r + 5),
+                position_ids, block_cut, kv_cache, gf, mask, static_cast<int>(i));
+        }
+        const int64_t rf = static_cast<int64_t>(depth * 6);
+        x = norm_out.build_cgraph_precomputed(ctx, x, make_mod_vec(rf + 0), make_mod_vec(rf + 1));
+    }
+    else
+    {
+        for (int i = 0; i < transformer_blocks.size() - 1; ++i)
+            x = transformer_blocks[i].build_cgraph(ctx, x, t, position_ids, 0, kv_cache, gf, mask, i);
+        // Apply `cut_len` only on the final block.
+        x = transformer_blocks.back().build_cgraph(ctx, x, t, position_ids, cut_len, kv_cache, gf, mask, static_cast<int>(transformer_blocks.size()) - 1);
 
-    x = norm_out.build_cgraph(ctx, x, t);
+        x = norm_out.build_cgraph(ctx, x, t);
+    }
 
     auto output = proj_out.build_cgraph(ctx, x);
     return output;
@@ -501,13 +614,19 @@ std::array<float, 2> CausalConditionalCFM::get_t_and_dt(ggml_context* ctx, int s
     return { t, dt };
 }
 
-ggml_tensor* CausalConditionalCFM::build_cgraph_one_step(ggml_context* ctx, const DiTContext& ditctx, int step, ggml_backend_op_capabilities capabilities, int64_t cut_len, ggml_tensor*& t_tensor, ggml_tensor*& position_ids, ggml_cgraph* gf, cosyvoice_kv_cache* kv_cache, ggml_tensor** attn_mask) const
+ggml_tensor* CausalConditionalCFM::build_cgraph_one_step(ggml_context* ctx, const DiTContext& ditctx, int step, ggml_backend_op_capabilities capabilities, int64_t cut_len, ggml_tensor*& t_tensor, ggml_tensor*& position_ids, ggml_cgraph* gf, cosyvoice_kv_cache* kv_cache, ggml_tensor** attn_mask, DiTModulationHandle* adaln_handle) const
 {
     auto x = ditctx.x;
     auto [t, dt] = get_t_and_dt(ctx, step);
 
-    auto t_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
-    t_in = capabilities.fill ? ggml_fill_inplace(ctx, t_in, t) : ggml_scale_bias_inplace(ctx, t_in, 0.f, t);
+    ggml_tensor* t_in = nullptr;
+    const bool use_precomputed = estimator.adaln_table != nullptr && adaln_handle != nullptr
+        && step >= 1 && step <= estimator.adaln_table->ne[2];
+    if (!use_precomputed)
+    {
+        t_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
+        t_in = capabilities.fill ? ggml_fill_inplace(ctx, t_in, t) : ggml_scale_bias_inplace(ctx, t_in, 0.f, t);
+    }
     auto x_in = ggml_repeat_4d(ctx, x, x->ne[0], x->ne[1], 2, x->ne[3]);
 
     auto [dphi_dt, cfg_dphi_dt] = split_tensor<2>(
@@ -522,7 +641,9 @@ ggml_tensor* CausalConditionalCFM::build_cgraph_one_step(ggml_context* ctx, cons
             capabilities,
             kv_cache,
             attn_mask,
-            gf),
+            gf,
+            use_precomputed ? (step - 1) : -1,
+            use_precomputed ? adaln_handle : nullptr),
         2);
 
     cfg_dphi_dt->nb[3] = dphi_dt->nb[3] = dphi_dt->nb[2];
@@ -742,6 +863,12 @@ std::array<ggml_tensor*, 2> SourceModuleHnNSF::build_cgraph(ggml_context* ctx, g
 
 ggml_tensor* Snake::build_cgraph(ggml_context* ctx, ggml_tensor* x) const
 {
+    if (inv_alpha)
+    {
+        auto x_sin = ggml_sin(ctx, ggml_mul(ctx, x, this->alpha));
+        x_sin = ggml_sqr(ctx, x_sin);
+        return ggml_add(ctx, x, ggml_mul(ctx, x_sin, inv_alpha));
+    }
     auto alpha = unsqueeze(ctx, this->alpha, 0);
     auto x_sin = ggml_sin(ctx, ggml_mul(ctx, x, alpha));
     x_sin = ggml_mul(ctx, x_sin, x_sin);
@@ -776,9 +903,15 @@ ggml_tensor* CausalConv1dUpsample::build_cgraph(ggml_context* ctx, ggml_tensor* 
 }
 
 std::array<ggml_tensor*, 2> CausalHiFTGenerator::build_cgraph(ggml_context* ctx, ggml_tensor* speech_feat, bool finalize, SineGen2::phase_state* state) const
+{ return build_cgraph_capture(ctx, speech_feat, finalize, nullptr, state); }
+
+std::array<ggml_tensor*, 2> CausalHiFTGenerator::build_cgraph_capture(ggml_context* ctx, ggml_tensor* speech_feat, bool finalize, hift_research::Capture* capture, SineGen2::phase_state* state) const
+
 {
     auto f0 = f0_predictor.build_cgraph(ctx, speech_feat, finalize);
+    if (capture) capture->keep("f0", f0);
     auto s_input = ggml_permute(ctx, f0, 1, 0, 2, 3); // [1, T', 1]
+
     s_input = ggml_interpolate(ctx, s_input, s_input->ne[0], s_input->ne[1] * scale_factor, s_input->ne[2], 1, GGML_SCALE_MODE_NEAREST);
 
     // The next chunk re-feeds the last `retain_frames` mel frames of this
@@ -789,6 +922,8 @@ std::array<ggml_tensor*, 2> CausalHiFTGenerator::build_cgraph(ggml_context* ctx,
         state->checkpoint_row = finalize ? -1 : speech_feat->ne[0] - state->retain_frames - 1;
 
     auto [s, noise] = m_source.build_cgraph(ctx, s_input, nb_harmonics, sampling_rate, scale_factor, nsf_alpha, nsf_voiced_threshold, nsf_sigma, state);
+    if (capture) capture->keep("excitation", s);
+
     s = ggml_permute(ctx, s, 1, 0, 2, 3);
 
     // decode
@@ -799,7 +934,8 @@ std::array<ggml_tensor*, 2> CausalHiFTGenerator::build_cgraph(ggml_context* ctx,
         x = conv_pre.build_cgraph(ctx, speech_feat, finalize);
 
         auto s_stft = ggml_stft(ctx, s, window, hop_len, true, fctx.get());
-        s_stft = ggml_cont(ctx, s_stft);
+        if (!ggml_is_contiguous(s_stft))
+            s_stft = ggml_cont(ctx, s_stft);
         s_stft = ggml_reshape_2d(ctx, s_stft, s_stft->ne[0], s_stft->ne[1] * 2);
         if (!finalize)
             s_stft = ggml_view_2d(ctx, s_stft, s_stft->ne[0] - (scale_factor / hop_len * conv_pre.causal_padding()), s_stft->ne[1], s_stft->nb[1], 0);
@@ -860,6 +996,12 @@ int CausalHiFTGenerator::overlap_length() const
 
 ggml_tensor* Qwen2MLP::build_cgraph(ggml_context* ctx, ggml_tensor* x) const
 {
+    if (gate_up_weight)
+    {
+        auto gate_up = ggml_mul_mat(ctx, gate_up_weight, x);
+        auto up_states = ggml_swiglu(ctx, gate_up);
+        return down_proj.build_cgraph(ctx, up_states);
+    }
     auto gate = gate_proj.build_cgraph(ctx, x);
     auto up_states = up_proj.build_cgraph(ctx, x);
 

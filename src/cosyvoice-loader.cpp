@@ -5,6 +5,7 @@
 #include <tuple>
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -13,6 +14,8 @@
 #include <format>
 #include <span>
 #include <ranges>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace
 {
@@ -802,7 +805,7 @@ void cosyvoice_model_3::load(gguf_loader& loader)
 
     ggml_init_params params =
     {
-        .mem_size = (tensors.size() + 6 + 2 * shared->params.n_workers) * ggml_tensor_overhead(),
+        .mem_size = (tensors.size() + 512 + 4 * shared->params.n_workers) * ggml_tensor_overhead(),
         .mem_buffer = nullptr,
         .no_alloc = true
     };
@@ -822,15 +825,342 @@ void cosyvoice_model_3::load(gguf_loader& loader)
     auto buft = ggml_backend_get_default_buffer_type(backend);
     auto alignment = ggml_backend_buft_get_alignment(buft);
 
+    // Precompute all DiT AdaLN modulation vectors on the active inference backend for the
+    // fixed diffusion schedule t_span[0..diffusion_steps-1]. Evaluating through the exact
+    // same backend ops (TimestepEmbedding + 22x AdaLayerNormZero.linear + AdaLayerNorm_Final.linear
+    // + scale_bias(+1)) guarantees bit-exact parity with on-the-fly execution on every backend
+    // while freeing ~283 MiB of F16 weights from permanent VRAM (~5.5 MiB F32 table retained).
+    std::unordered_set<ggml_tensor**> precomputed_adaln_tensors;
+    std::vector<float> adaln_host;
+    int64_t adaln_dim = 0;
+    int64_t adaln_rows = 0;
+    const int adaln_steps = flow.decoder.diffusion_steps;
+    if (adaln_steps > 0)
+    {
+        auto& dit = flow.decoder.estimator;
+        const size_t depth = dit.transformer_blocks.size();
+        auto linear_eligible = [](const Linear& lin)
+        {
+            if (!lin.weight || lin.lora_a || lin.lora_b || lin.lora_enabled)
+                return false;
+            if (get_tensor_eps(lin.weight) != 0.f)
+                return false;
+            if (lin.bias && get_tensor_eps(lin.bias) != 0.f)
+                return false;
+            return true;
+        };
+        bool can_precompute = depth > 0
+            && linear_eligible(dit.time_embed.time_mlp_0)
+            && linear_eligible(dit.time_embed.time_mlp_2)
+            && linear_eligible(dit.norm_out.linear)
+            && dit.norm_out.linear.weight->ne[1] > 0
+            && (dit.norm_out.linear.weight->ne[1] % 2) == 0;
+        if (can_precompute)
+        {
+            adaln_dim = dit.norm_out.linear.weight->ne[1] / 2;
+            for (size_t b = 0; b != depth; ++b)
+            {
+                const auto& lin = dit.transformer_blocks[b].attn_norm.linear;
+                if (!linear_eligible(lin) || lin.weight->ne[1] != 6 * adaln_dim)
+                {
+                    can_precompute = false;
+                    break;
+                }
+            }
+        }
+        if (can_precompute)
+        {
+            auto aligned_alloc_size = [&](const ggml_tensor* t) -> size_t
+            {
+                return t ? get_aligned_size(ggml_backend_buft_get_alloc_size(buft, t), alignment) : 0;
+            };
+            const size_t emb_bytes = get_aligned_size(sizeof(float) * half_dim, alignment);
+            const size_t t_pair_bytes = get_aligned_size(sizeof(float) * 2, alignment);
+            size_t tmp_w_bytes = emb_bytes
+                + aligned_alloc_size(dit.time_embed.time_mlp_0.weight)
+                + aligned_alloc_size(dit.time_embed.time_mlp_0.bias)
+                + aligned_alloc_size(dit.time_embed.time_mlp_2.weight)
+                + aligned_alloc_size(dit.time_embed.time_mlp_2.bias)
+                + t_pair_bytes * static_cast<size_t>(adaln_steps);
+            for (size_t b = 0; b != depth; ++b)
+            {
+                const auto& lin = dit.transformer_blocks[b].attn_norm.linear;
+                tmp_w_bytes = std::max(tmp_w_bytes, aligned_alloc_size(lin.weight) + aligned_alloc_size(lin.bias));
+            }
+            tmp_w_bytes = std::max(tmp_w_bytes,
+                aligned_alloc_size(dit.norm_out.linear.weight) + aligned_alloc_size(dit.norm_out.linear.bias));
+
+            const int64_t mlp2_out = dit.time_embed.time_mlp_2.weight->ne[1];
+            const size_t temb_slot_bytes = get_aligned_size(sizeof(float) * static_cast<size_t>(mlp2_out * 2), alignment);
+            const size_t temb_total_bytes = temb_slot_bytes * static_cast<size_t>(adaln_steps);
+            const size_t backend_max_buf = ggml_backend_get_max_size(backend);
+
+            if (tmp_w_bytes <= backend_max_buf && temb_total_bytes <= backend_max_buf)
+            {
+                ggml_backend_buffer_ptr tmp_w_buf(ggml_backend_buft_alloc_buffer(buft, tmp_w_bytes));
+                ggml_backend_buffer_ptr tmp_temb_buf(ggml_backend_buft_alloc_buffer(buft, temb_total_bytes));
+                const size_t graph_size = static_cast<size_t>(std::max(2048, adaln_steps * 32));
+                ggml_backend_t sched_backends[] = { backend, cpu_backend };
+                ggml_backend_sched_ptr tmp_sched(ggml_backend_sched_new(
+                    sched_backends,
+                    nullptr,
+                    backend == cpu_backend ? 1 : 2,
+                    graph_size,
+                    false,
+                    true));
+
+                ggml_context_ptr temb_ctx(ggml_init({
+                    .mem_size = static_cast<size_t>(adaln_steps + 4) * ggml_tensor_overhead(),
+                    .mem_buffer = nullptr,
+                    .no_alloc = true
+                }));
+                ggml_context_ptr graph_ctx(ggml_init({
+                    .mem_size = ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
+                    .mem_buffer = nullptr,
+                    .no_alloc = true
+                }));
+
+                auto assign_backends = [&](ggml_cgraph* gf)
+                {
+                    const auto& op_caps = shared->op_caps;
+                    auto is_virtual = [](ggml_op op)
+                    {
+                        return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+                    };
+                    for (auto* node : ggml_cgraph_node_iterator(gf))
+                    {
+                        if (node->data)
+                            continue;
+                        auto op = node->op;
+                        auto* src = node;
+                        while (src && is_virtual(src->op))
+                            src = src->src[0];
+                        if (src)
+                            op = src->op;
+                        ggml_backend_t target = backend;
+                        if (op == GGML_OP_SIN && !op_caps.sin)
+                            target = cpu_backend;
+                        else if (op == GGML_OP_COS && !op_caps.cos)
+                            target = cpu_backend;
+                        ggml_backend_sched_set_tensor_backend(tmp_sched.get(), node, target);
+                    }
+                };
+
+                bool ok = tmp_w_buf && tmp_temb_buf && tmp_sched && temb_ctx && graph_ctx;
+                std::vector<ggml_tensor*> t_emb_s(static_cast<size_t>(adaln_steps), nullptr);
+
+                // Stage 1: Compute TimestepEmbedding(t_span[s]) -> silu for all steps on backend.
+                if (ok)
+                {
+                    ggml_context_ptr stage1_ctx(ggml_init({
+                        .mem_size = static_cast<size_t>(adaln_steps + 16) * ggml_tensor_overhead(),
+                        .mem_buffer = nullptr,
+                        .no_alloc = true
+                    }));
+                    if (!stage1_ctx)
+                        ok = false;
+                    else
+                    {
+                    char* w_cur = reinterpret_cast<char*>(ggml_backend_buffer_get_base(tmp_w_buf.get()));
+                    auto stage_copy = [&](const ggml_tensor* orig) -> ggml_tensor*
+                    {
+                        if (!orig) return nullptr;
+                        ggml_tensor* t = ggml_new_tensor(stage1_ctx.get(), orig->type, GGML_MAX_DIMS, orig->ne);
+                        ggml_backend_tensor_alloc(tmp_w_buf.get(), t, w_cur);
+                        w_cur += aligned_alloc_size(t);
+                        ggml_backend_tensor_set(t, ggml_get_data(orig), 0, ggml_nbytes(orig));
+                        return t;
+                    };
+
+                    TimestepEmbedding tmp_te;
+                    tmp_te.time_embed.emb = ggml_new_tensor_1d(stage1_ctx.get(), GGML_TYPE_F32, half_dim);
+                    ggml_backend_tensor_alloc(tmp_w_buf.get(), tmp_te.time_embed.emb, w_cur);
+                    w_cur += emb_bytes;
+                    ggml_backend_tensor_set(tmp_te.time_embed.emb, emb_buffer.get(), 0, sizeof(float) * half_dim);
+                    tmp_te.time_mlp_0.weight = stage_copy(dit.time_embed.time_mlp_0.weight);
+                    tmp_te.time_mlp_0.bias   = stage_copy(dit.time_embed.time_mlp_0.bias);
+                    tmp_te.time_mlp_2.weight = stage_copy(dit.time_embed.time_mlp_2.weight);
+                    tmp_te.time_mlp_2.bias   = stage_copy(dit.time_embed.time_mlp_2.bias);
+
+                    ggml_cgraph* gf = ggml_new_graph_custom(graph_ctx.get(), graph_size, false);
+                    std::vector<ggml_tensor*> te_outs(static_cast<size_t>(adaln_steps), nullptr);
+                    for (int s = 0; s != adaln_steps; ++s)
+                    {
+                        const float t_val = flow.decoder.get_t_and_dt(nullptr, s + 1)[0];
+                        const float t_pair[2] = { t_val, t_val };
+                        ggml_tensor* t_in = ggml_new_tensor_1d(stage1_ctx.get(), GGML_TYPE_F32, 2);
+                        ggml_backend_tensor_alloc(tmp_w_buf.get(), t_in, w_cur);
+                        w_cur += t_pair_bytes;
+                        ggml_backend_tensor_set(t_in, t_pair, 0, sizeof(t_pair));
+
+                        ggml_tensor* te = tmp_te.build_cgraph(graph_ctx.get(), t_in);
+                        te = ggml_silu(graph_ctx.get(), te);
+                        ggml_set_output(te);
+                        ggml_build_forward_expand(gf, te);
+                        te_outs[static_cast<size_t>(s)] = te;
+                    }
+                    assign_backends(gf);
+                    if (!ggml_backend_sched_alloc_graph(tmp_sched.get(), gf)
+                        || ggml_backend_sched_graph_compute(tmp_sched.get(), gf) != GGML_STATUS_SUCCESS)
+                    {
+                        ok = false;
+                    }
+                    else
+                    {
+                        char* te_cur = reinterpret_cast<char*>(ggml_backend_buffer_get_base(tmp_temb_buf.get()));
+                        std::vector<float> te_host(static_cast<size_t>(mlp2_out * 2));
+                        const size_t te_nbytes = te_host.size() * sizeof(float);
+                        for (int s = 0; s != adaln_steps; ++s)
+                        {
+                            ggml_backend_tensor_get(te_outs[static_cast<size_t>(s)], te_host.data(), 0, te_nbytes);
+                            ggml_tensor* ts = ggml_new_tensor_2d(temb_ctx.get(), GGML_TYPE_F32, mlp2_out, 2);
+                            ggml_backend_tensor_alloc(tmp_temb_buf.get(), ts, te_cur);
+                            te_cur += temb_slot_bytes;
+                            ggml_backend_tensor_set(ts, te_host.data(), 0, te_nbytes);
+                            t_emb_s[static_cast<size_t>(s)] = ts;
+                        }
+                    }
+                    }
+                }
+
+                // Stage 2: Stream each block's AdaLN linear + final norm linear through tmp_w_buf.
+                if (ok)
+                {
+                    adaln_rows = static_cast<int64_t>(depth) * 6 + 2;
+                    adaln_host.assign(static_cast<size_t>(adaln_dim * adaln_rows * adaln_steps), 0.0f);
+                    const size_t step_stride = static_cast<size_t>(adaln_dim * adaln_rows);
+
+                    ggml_context_ptr lin_ctx(ggml_init({
+                        .mem_size = 16 * ggml_tensor_overhead(),
+                        .mem_buffer = nullptr,
+                        .no_alloc = true
+                    }));
+                    if (!lin_ctx)
+                        ok = false;
+
+                    auto eval_staged_linear = [&](const Linear& src_lin, int64_t n_rows, int64_t row_base,
+                                                  std::initializer_list<int64_t> scale_row_offsets) -> bool
+                    {
+                        ggml_reset(lin_ctx.get());
+                        ggml_reset(graph_ctx.get());
+                        ggml_backend_sched_reset(tmp_sched.get());
+
+                        char* w_cur = reinterpret_cast<char*>(ggml_backend_buffer_get_base(tmp_w_buf.get()));
+                        Linear tmp_lin;
+                        tmp_lin.weight = ggml_new_tensor(lin_ctx.get(), src_lin.weight->type, GGML_MAX_DIMS, src_lin.weight->ne);
+                        ggml_backend_tensor_alloc(tmp_w_buf.get(), tmp_lin.weight, w_cur);
+                        w_cur += aligned_alloc_size(tmp_lin.weight);
+                        ggml_backend_tensor_set(tmp_lin.weight, ggml_get_data(src_lin.weight), 0, ggml_nbytes(src_lin.weight));
+                        if (src_lin.bias)
+                        {
+                            tmp_lin.bias = ggml_new_tensor(lin_ctx.get(), src_lin.bias->type, GGML_MAX_DIMS, src_lin.bias->ne);
+                            ggml_backend_tensor_alloc(tmp_w_buf.get(), tmp_lin.bias, w_cur);
+                            w_cur += aligned_alloc_size(tmp_lin.bias);
+                            ggml_backend_tensor_set(tmp_lin.bias, ggml_get_data(src_lin.bias), 0, ggml_nbytes(src_lin.bias));
+                        }
+
+                        ggml_cgraph* gf = ggml_new_graph_custom(graph_ctx.get(), graph_size, false);
+                        std::vector<ggml_tensor*> emb_outs(static_cast<size_t>(adaln_steps), nullptr);
+                        std::vector<std::vector<ggml_tensor*>> scale_outs(
+                            static_cast<size_t>(adaln_steps), std::vector<ggml_tensor*>(scale_row_offsets.size(), nullptr));
+                        for (int s = 0; s != adaln_steps; ++s)
+                        {
+                            ggml_tensor* emb_s = tmp_lin.build_cgraph(graph_ctx.get(), t_emb_s[static_cast<size_t>(s)]);
+                            ggml_set_output(emb_s);
+                            ggml_build_forward_expand(gf, emb_s);
+                            emb_outs[static_cast<size_t>(s)] = emb_s;
+
+                            size_t k = 0;
+                            for (int64_t r_off : scale_row_offsets)
+                            {
+                                ggml_tensor* sv = ggml_view_1d(graph_ctx.get(), emb_s, adaln_dim,
+                                    static_cast<size_t>(r_off * adaln_dim) * sizeof(float));
+                                ggml_tensor* sp1 = ggml_scale_bias(graph_ctx.get(), ggml_cont(graph_ctx.get(), sv), 1.f, 1.f);
+                                ggml_set_output(sp1);
+                                ggml_build_forward_expand(gf, sp1);
+                                scale_outs[static_cast<size_t>(s)][k++] = sp1;
+                            }
+                        }
+                        assign_backends(gf);
+                        if (!ggml_backend_sched_alloc_graph(tmp_sched.get(), gf)
+                            || ggml_backend_sched_graph_compute(tmp_sched.get(), gf) != GGML_STATUS_SUCCESS)
+                            return false;
+
+                        for (int s = 0; s != adaln_steps; ++s)
+                        {
+                            float* dst = adaln_host.data()
+                                + static_cast<size_t>(s) * step_stride
+                                + static_cast<size_t>(row_base * adaln_dim);
+                            ggml_backend_tensor_get(emb_outs[static_cast<size_t>(s)], dst, 0,
+                                static_cast<size_t>(n_rows * adaln_dim) * sizeof(float));
+                            size_t k = 0;
+                            for (int64_t r_off : scale_row_offsets)
+                            {
+                                ggml_backend_tensor_get(scale_outs[static_cast<size_t>(s)][k++],
+                                    dst + static_cast<size_t>(r_off * adaln_dim), 0,
+                                    static_cast<size_t>(adaln_dim) * sizeof(float));
+                            }
+                        }
+                        return true;
+                    };
+
+                    for (size_t b = 0; b != depth && ok; ++b)
+                        ok = eval_staged_linear(dit.transformer_blocks[b].attn_norm.linear, 6, static_cast<int64_t>(b * 6), { 1, 4 });
+                    if (ok)
+                        ok = eval_staged_linear(dit.norm_out.linear, 2, static_cast<int64_t>(depth * 6), { 0 });
+                }
+
+                ggml_backend_synchronize(backend);
+
+                if (ok)
+                {
+                    auto mark_skip_linear = [&](Linear& lin)
+                    {
+                        if (lin.weight) { precomputed_adaln_tensors.insert(&lin.weight); lin.weight = nullptr; }
+                        if (lin.bias)   { precomputed_adaln_tensors.insert(&lin.bias);   lin.bias = nullptr; }
+                    };
+                    mark_skip_linear(dit.time_embed.time_mlp_0);
+                    mark_skip_linear(dit.time_embed.time_mlp_2);
+                    for (auto& blk : dit.transformer_blocks)
+                        mark_skip_linear(blk.attn_norm.linear);
+                    mark_skip_linear(dit.norm_out.linear);
+                }
+                else
+                {
+                    adaln_host.clear();
+                    adaln_rows = 0;
+                }
+            }
+        }
+    }
+
     const int mel_dim = flow.decoder.estimator.mel_dim;
-    size_t mem_size = get_aligned_size(sizeof(float) * half_dim, alignment)
+    size_t mem_size = (adaln_host.empty() ? get_aligned_size(sizeof(float) * half_dim, alignment)
+                                          : get_aligned_size(adaln_host.size() * sizeof(float), alignment))
         + get_aligned_size(sizeof(float) * (hift.nfft / 2 + 1), alignment)
         + get_aligned_size(sizeof(float) * (hift.nfft / 2 + 1) * hift.nfft, alignment) * 2
-        + get_aligned_size(sizeof(int) * shared->params.n_batch, alignment) * shared->params.n_workers;
+        + get_aligned_size(sizeof(int) * shared->params.n_batch, alignment) * shared->params.n_workers
+        + get_aligned_size(sizeof(ggml_fp16_t) * shared->params.n_max_seq, alignment) * shared->params.n_workers
+        + get_aligned_size(sizeof(float) * (hift.nb_harmonics + 1), alignment);
     for (const auto& [name, tensor] : tensors)
         if (tensor != &llm.embed_tokens_weight
-            && tensor != &llm.speech_embedding_weight)
+            && tensor != &llm.speech_embedding_weight
+            && !precomputed_adaln_tensors.count(tensor))
             mem_size += get_aligned_size(ggml_backend_buft_get_alloc_size(buft, *tensor), alignment);
+
+    {
+        auto add_snake_mem = [&](const std::vector<ResBlock>& blocks)
+        {
+            for (const auto& rb : blocks)
+                for (const auto& [act1, conv1, act2, conv2] : rb.convs)
+                {
+                    if (act1.alpha) mem_size += get_aligned_size(ggml_backend_buft_get_alloc_size(buft, act1.alpha), alignment);
+                    if (act2.alpha) mem_size += get_aligned_size(ggml_backend_buft_get_alloc_size(buft, act2.alpha), alignment);
+                }
+        };
+        add_snake_mem(hift.resblocks);
+        add_snake_mem(hift.source_resblocks);
+    }
 
     // Split the packed weights over as many buffers as needed: some backends
     // cannot create a single allocation above a device limit (reported through
@@ -933,12 +1263,141 @@ void cosyvoice_model_3::load(gguf_loader& loader)
         ggml_backend_tensor_set(tensor, data, 0, size);
         cpu_buffer_base += ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(cpu_backend), tensor);
     };
-    flow.decoder.estimator.time_embed.time_embed.emb = ggml_new_tensor_1d(shared->ctx.get(), GGML_TYPE_F32, half_dim);
-    alloc_device_tensor(flow.decoder.estimator.time_embed.time_embed.emb);
-    set_tensor(flow.decoder.estimator.time_embed.time_embed.emb, emb_buffer.get(), sizeof(float) * half_dim);
+    if (!adaln_host.empty())
+    {
+        flow.decoder.estimator.adaln_table = ggml_new_tensor_3d(shared->ctx.get(), GGML_TYPE_F32, adaln_dim, adaln_rows, adaln_steps);
+        ggml_set_name(flow.decoder.estimator.adaln_table, "dit.adaln_table");
+        alloc_device_tensor(flow.decoder.estimator.adaln_table);
+        set_tensor(flow.decoder.estimator.adaln_table, adaln_host.data(), adaln_host.size() * sizeof(float));
+    }
+    else
+    {
+        flow.decoder.estimator.time_embed.time_embed.emb = ggml_new_tensor_1d(shared->ctx.get(), GGML_TYPE_F32, half_dim);
+        alloc_device_tensor(flow.decoder.estimator.time_embed.time_embed.emb);
+        set_tensor(flow.decoder.estimator.time_embed.time_embed.emb, emb_buffer.get(), sizeof(float) * half_dim);
+    }
+
+    std::unordered_map<ggml_tensor**, std::string> tensor_name_map;
+    tensor_name_map.reserve(tensors.size());
+    for (const auto& [name, tptr] : tensors)
+        tensor_name_map[tptr] = name;
+
+    std::unordered_set<ggml_tensor**> fused_members;
+
+    auto try_fuse_group = [&](std::initializer_list<ggml_tensor**> parts_list,
+                              bool is_2d,
+                              ggml_tensor** fused_out,
+                              const std::string& fused_name,
+                              ggml_tensor** tail_out = nullptr,
+                              size_t tail_start = 1,
+                              const std::string& tail_name = {})
+    {
+        std::vector<ggml_tensor**> parts(parts_list);
+        if (parts.size() < 2)
+            return;
+
+        const ggml_type ref_type = (*parts[0]) ? (*parts[0])->type : GGML_TYPE_COUNT;
+        const int64_t ref_ne0 = (*parts[0]) ? (*parts[0])->ne[0] : 0;
+        int64_t total_cat = 0;
+        size_t total_bytes = 0;
+        for (size_t i = 0; i != parts.size(); ++i)
+        {
+            ggml_tensor* t = *parts[i];
+            if (!t || fused_members.count(parts[i]) || get_tensor_eps(t) != 0.f)
+                return;
+            if (t->type != ref_type || t->ne[2] != 1 || t->ne[3] != 1)
+                return;
+            if (is_2d)
+            {
+                if (t->ne[0] != ref_ne0 || t->ne[1] <= 0)
+                    return;
+                total_cat += t->ne[1];
+            }
+            else
+            {
+                if (t->ne[1] != 1 || t->ne[0] <= 0)
+                    return;
+                total_cat += t->ne[0];
+            }
+            const size_t nbytes = ggml_nbytes(t);
+            if (ggml_backend_buft_get_alloc_size(buft, t) != nbytes)
+                return;
+            if (i + 1 != parts.size() && (nbytes % alignment) != 0)
+                return;
+            total_bytes += nbytes;
+        }
+
+        const size_t aligned_total = get_aligned_size(total_bytes, alignment);
+        if (aligned_total > max_buffer_size)
+            return;
+
+        ggml_tensor* fused = is_2d
+            ? ggml_new_tensor_2d(shared->ctx.get(), ref_type, ref_ne0, total_cat)
+            : ggml_new_tensor_1d(shared->ctx.get(), ref_type, total_cat);
+        if (ggml_backend_buft_get_alloc_size(buft, fused) != total_bytes)
+            return;
+        ggml_set_name(fused, fused_name.c_str());
+
+        char* base = alloc_device_bytes(aligned_total);
+        auto* cur_buf = device_buffers.back().get();
+        ggml_backend_tensor_alloc(cur_buf, fused, base);
+        *fused_out = fused;
+
+        size_t byte_off = 0;
+        size_t tail_byte_off = 0;
+        int64_t tail_cat = 0;
+        for (size_t i = 0; i != parts.size(); ++i)
+        {
+            ggml_tensor* orig = *parts[i];
+            const size_t nbytes = ggml_nbytes(orig);
+            if (i == tail_start)
+                tail_byte_off = byte_off;
+            if (i >= tail_start)
+                tail_cat += is_2d ? orig->ne[1] : orig->ne[0];
+
+            ggml_tensor* new_tensor = ggml_new_tensor(shared->ctx.get(), orig->type, GGML_MAX_DIMS, orig->ne);
+            if (auto it = tensor_name_map.find(parts[i]); it != tensor_name_map.end())
+                ggml_set_name(new_tensor, it->second.c_str());
+            ggml_backend_tensor_alloc(cur_buf, new_tensor, base + byte_off);
+            set_tensor(new_tensor, ggml_get_data(orig), nbytes);
+            *parts[i] = new_tensor;
+            fused_members.insert(parts[i]);
+            byte_off += nbytes;
+        }
+
+        if (tail_out && tail_cat > 0)
+        {
+            ggml_tensor* tail = is_2d
+                ? ggml_new_tensor_2d(shared->ctx.get(), ref_type, ref_ne0, tail_cat)
+                : ggml_new_tensor_1d(shared->ctx.get(), ref_type, tail_cat);
+            if (ggml_backend_buft_get_alloc_size(buft, tail) == (total_bytes - tail_byte_off))
+            {
+                ggml_set_name(tail, tail_name.c_str());
+                ggml_backend_tensor_alloc(cur_buf, tail, base + tail_byte_off);
+                *tail_out = tail;
+            }
+        }
+    };
+
+    for (size_t i = 0; i != llm.layers.size(); ++i)
+    {
+        auto& attn = llm.layers[i].self_attn;
+        try_fuse_group({ &attn.q_proj.weight, &attn.k_proj.weight, &attn.v_proj.weight }, true,
+            &attn.qkv_weight, std::format("layers.{}.self_attn.qkv.weight", i));
+        if (attn.qkv_weight && attn.q_proj.bias && attn.k_proj.bias && attn.v_proj.bias)
+            try_fuse_group({ &attn.q_proj.bias, &attn.k_proj.bias, &attn.v_proj.bias }, false,
+                &attn.qkv_bias, std::format("layers.{}.self_attn.qkv.bias", i));
+
+        auto& mlp = llm.layers[i].mlp;
+        if (!mlp.gate_proj.bias && !mlp.up_proj.bias)
+            try_fuse_group({ &mlp.gate_proj.weight, &mlp.up_proj.weight }, true,
+                &mlp.gate_up_weight, std::format("layers.{}.mlp.gate_up.weight", i));
+    }
 
     for (const auto& [name, tensor] : tensors)
     {
+        if (fused_members.count(tensor) || precomputed_adaln_tensors.count(tensor))
+            continue;
         size_t tensor_size = ggml_nbytes(*tensor);
         auto new_tensor = ggml_new_tensor(shared->ctx.get(), (*tensor)->type, GGML_MAX_DIMS, (*tensor)->ne);
         ggml_set_name(new_tensor, name.c_str());
@@ -971,16 +1430,59 @@ void cosyvoice_model_3::load(gguf_loader& loader)
 
                         buffer[i] = eps;
                     }
-                set_tensor(new_tensor, buffer ? buffer.get() : data, tensor_size);
+                if (buffer)
+                    ggml_backend_tensor_set(new_tensor, buffer.get(), 0, tensor_size);
+                else
+                    set_tensor(new_tensor, data, tensor_size);
             }
         }
 
         *tensor = new_tensor;
-        ggml_set_param(*tensor);
+    }
+
+    // Prepare HiFT Snake activations as [1, C] F32 (alpha, 1/alpha) pairs so
+    // Vulkan fuses MUL->SIN->SQR->MUL->ADD into a single SNAKE kernel (72x).
+    {
+        ggml_backend_synchronize(backend);
+        auto prepare_snake = [&](Snake& snk)
+        {
+            if (!snk.alpha || snk.alpha->type != GGML_TYPE_F32
+                || snk.alpha->ne[1] != 1 || snk.alpha->ne[2] != 1 || snk.alpha->ne[3] != 1)
+                return;
+            const int64_t C = snk.alpha->ne[0];
+            std::vector<float> vals(static_cast<size_t>(C));
+            ggml_backend_tensor_get(snk.alpha, vals.data(), 0, vals.size() * sizeof(float));
+            for (float& v : vals)
+                v = 1.0f / v;
+
+            // Reshape alpha in-place from [C] to [1, C] (identical contiguous layout, zero VIEW ops).
+            snk.alpha->ne[0] = 1;
+            snk.alpha->ne[1] = C;
+            snk.alpha->nb[0] = sizeof(float);
+            snk.alpha->nb[1] = sizeof(float);
+            snk.alpha->nb[2] = static_cast<size_t>(C) * sizeof(float);
+            snk.alpha->nb[3] = snk.alpha->nb[2];
+
+            ggml_tensor* inv = ggml_new_tensor_2d(shared->ctx.get(), GGML_TYPE_F32, 1, C);
+            ggml_set_name(inv, (std::string(snk.alpha->name) + ".inv").c_str());
+            alloc_device_tensor(inv);
+            ggml_backend_tensor_set(inv, vals.data(), 0, vals.size() * sizeof(float));
+            snk.inv_alpha = inv;
+        };
+        auto prepare_resblocks = [&](std::vector<ResBlock>& blocks)
+        {
+            for (auto& rb : blocks)
+                for (auto& [act1, conv1, act2, conv2] : rb.convs)
+                {
+                    prepare_snake(act1);
+                    prepare_snake(act2);
+                }
+        };
+        prepare_resblocks(hift.resblocks);
+        prepare_resblocks(hift.source_resblocks);
     }
 
     hift.window = ggml_new_tensor_1d(shared->ctx.get(), GGML_TYPE_F32, hift.nfft);
-    ggml_set_param(hift.window);
     ggml_set_name(hift.window, "stft_window");
     ggml_backend_tensor_alloc(shared->cpu_buffer.get(), hift.window, cpu_buffer_base);
     for (int i = 0; i != hift.nfft; ++i)
@@ -992,7 +1494,6 @@ void cosyvoice_model_3::load(gguf_loader& loader)
         {
             alloc_device_tensor(tensor);
             set_tensor(tensor, data, size);
-            ggml_set_param(tensor);
             ggml_backend_synchronize(backend);
         });
 
@@ -1007,10 +1508,16 @@ void cosyvoice_model_3::load(gguf_loader& loader)
         worker->position_ids = ggml_new_tensor_1d(shared->ctx.get(), GGML_TYPE_I32, shared->params.n_batch);
         ggml_set_name(worker->position_ids, std::format("position_ids.{}", i).c_str());
         alloc_device_tensor(worker->position_ids);
-        ggml_set_param(worker->position_ids);
 
         worker->causal_mask = ggml_new_tensor_2d(shared->ctx.get(), GGML_TYPE_F16, shared->params.n_max_seq - 1, shared->params.n_batch);
         ggml_set_input(worker->causal_mask);
+
+        worker->causal_mask_task = ggml_new_tensor_2d(shared->ctx.get(), GGML_TYPE_F16, shared->params.n_max_seq - 1, shared->params.n_batch);
+        ggml_set_input(worker->causal_mask_task);
+
+        worker->decode_mask = ggml_new_tensor_2d(shared->ctx.get(), GGML_TYPE_F16, shared->params.n_max_seq, 1);
+        ggml_set_name(worker->decode_mask, std::format("decode_mask.{}", i).c_str());
+        alloc_device_tensor(worker->decode_mask);
     }
 
     shared->noise_rng.seed(shared->params.seed);
@@ -1080,7 +1587,7 @@ void cosyvoice_model_3::load(gguf_loader& loader)
         cv3_shared->llm.layers[0].self_attn.q_proj, cv3_shared->llm.layers[0].self_attn.k_proj, cv3_shared->llm.layers[0].self_attn.v_proj,
         shared->params.llm_allow_kv_cache_fallback, reinterpret_cast<kv_cache_type_union&>(shared->params.llm_kv_cache_type));
 
-    auto [dit_k_type, dit_v_type] = shared->params.dit_kv_fixed_slots != 0 ?
+    auto [dit_k_type, dit_v_type] = (shared->params.dit_kv_fixed_slots + shared->params.dit_kv_offloadable_slots) != 0 ?
         cosyvoice_check_kv_cache_types(worker->ctx0.get(), worker->backend.get(),
             shared->params.flow_use_flash_attn, cv3_shared->flow.decoder.estimator.transformer_blocks[0].attn.heads, cv3_shared->flow.decoder.estimator.transformer_blocks[0].attn.heads,
             cv3_shared->flow.decoder.estimator.transformer_blocks[0].attn.to_q, cv3_shared->flow.decoder.estimator.transformer_blocks[0].attn.to_k, cv3_shared->flow.decoder.estimator.transformer_blocks[0].attn.to_v,
