@@ -183,6 +183,8 @@ Current backend test results are as follows:
 - Backend-specific issues are summarized in [Backend Test Status](#backend-test-status).
 
 ## Documentation
+
+For inference and deployment, use the [r2 runtime branch](https://github.com/ruina37520198-a11y/cosyvoice.cpp/tree/codex/aitable-v0.2.1-r2). To train a voice overlay, start with the [training toolkit](tools/voice_overlay_training/README.md) or the [Chinese training guide](docs/VOICE_OVERLAY_TRAINING_zh.md).
 - **Build guide:** [docs/BUILD.md](docs/BUILD.md)
 - **Tooling guide:** [docs/TOOLS.md](docs/TOOLS.md)
 - **Streaming / DiT KV cache / buffer policies:** [docs/STREAMING.md](docs/STREAMING.md)

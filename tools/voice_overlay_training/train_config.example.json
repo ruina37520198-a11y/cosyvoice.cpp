@@ -1,0 +1,78 @@
+{
+  "voice_name": "my_custom_voice",
+  "paths": {
+    "base_gguf": "./models/CosyVoice3-2512_F32.gguf",
+    "infer_base_gguf": "./models/CosyVoice3-2512_F16_HiFT-F32.gguf",
+    "speech_tokenizer_onnx": "./models/speech_tokenizer_v3.onnx",
+    "campplus_onnx": "./models/campplus.onnx",
+    "cosyvoice_runtime_dir": "./runtime",
+    "raw_dataset_dir": "./data/raw",
+    "processed_dataset_dir": "./data/processed",
+    "replay_manifest": "./data/replay/replay_manifest.json",
+    "runs_dir": "./runs"
+  },
+  "dataset": {
+    "min_duration_sec": 1.2,
+    "max_duration_sec": 18.0,
+    "normalize_chinese_to_simplified": true,
+    "instruction_prefix": "You are a helpful assistant.",
+    "parallel_workers": 4,
+    "val_ratio": 0.1,
+    "audio_preprocess": {
+      "enabled": true,
+      "trim_silence": true,
+      "silence_threshold_db": -42.0,
+      "relative_threshold_db": 35.0,
+      "lead_ms": 75.0,
+      "tail_ms": 150.0,
+      "fade_ms": 15.0,
+      "normalize_loudness": true,
+      "target_rms_db": -20.0,
+      "peak_ceiling_db": -1.0,
+      "debreath_enabled": false,
+      "debreath_attenuation_db": -22.0
+    }
+  },
+  "training": {
+    "mode": "lora",
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "use_rslora": true,
+    "lora_dropout": 0.1,
+    "lora_plus_ratio": 2.0,
+    "lower_layers_end": 8,
+    "lower_layers_lr_mult": 0.25,
+    "train_speech_head": false,
+    "llm_decoder_lora_r": 0,
+    "head_lr_mult": 0.25,
+    "label_smoothing": 0.05,
+    "eos_loss_weight": 1.5,
+    "epochs": 6,
+    "save_every_epochs": 1,
+    "grad_accum_steps": 4,
+    "learning_rate": 2e-05,
+    "full_finetune_lr": 1e-05,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.1,
+    "max_grad_norm": 1.0,
+    "zero_shot_pair_prob": 0.6,
+    "instruct_prob": 0.15,
+    "neutral_instruct_pool": [
+      "自然地说话。",
+      "用自然清晰的声音说话。"
+    ],
+    "replay_ratio": 0.25,
+    "replay_ce_drift_warn": 0.15,
+    "max_paired_speech_tokens": 750,
+    "selection_metric": "val_zeroshot_ce",
+    "overlay_precision": "f32",
+    "save_merged_pt": false,
+    "seed": 42
+  },
+  "eval": {
+    "scales": [0.55, 0.7, 0.85],
+    "backend": null,
+    "llm_kv_cache_type": "f16",
+    "seed": 42
+  }
+}

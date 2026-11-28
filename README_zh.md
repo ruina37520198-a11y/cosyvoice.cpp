@@ -175,6 +175,8 @@ flowchart TD
 - 后端相关情况见[后端测试情况](#后端测试情况)。
 
 ## 文档
+
+运行语音合成请使用 [r2 推理分支](https://github.com/ruina37520198-a11y/cosyvoice.cpp/tree/codex/aitable-v0.2.1-r2)。训练角色音色请参阅[中文训练指南](docs/VOICE_OVERLAY_TRAINING_zh.md)和[训练工具快速入门](tools/voice_overlay_training/README.md)。
 - **构建指南：** [docs/BUILD_zh.md](docs/BUILD_zh.md)
 - **工具说明：** [docs/TOOLS_zh.md](docs/TOOLS_zh.md)
 - **流式 TTS / DiT KV 缓存 / Buffer 策略：** [docs/STREAMING_zh.md](docs/STREAMING_zh.md)
